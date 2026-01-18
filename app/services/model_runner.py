@@ -89,17 +89,37 @@ def _load_model_and_tokenizer(model_id: str, device: str) -> tuple[torch.nn.Modu
     logger.info(f"Loading model: {model_id} on device: {device}")
     
     try:
+        # Get HuggingFace token from environment if available
+        import os
+        hf_token = os.environ.get('HUGGINGFACE_HUB_TOKEN') or os.environ.get('HF_TOKEN')
+        
+        # Prepare model loading kwargs
+        model_kwargs = {
+            "torch_dtype": torch.float16 if device in ("cuda", "mps") else torch.float32,
+            "low_cpu_mem_usage": True,
+        }
+        
+        # Add token if available (for private or gated models)
+        if hf_token:
+            model_kwargs["token"] = hf_token
+            logger.debug("Using HuggingFace token for authentication")
+        
+        # Add device_map for CUDA/MPS
+        if device in ("cuda", "mps"):
+            model_kwargs["device_map"] = "auto"
+        
         # Load tokenizer
         logger.debug("Loading tokenizer...")
-        _global_tokenizer = AutoTokenizer.from_pretrained(model_id)
+        if hf_token:
+            _global_tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
+        else:
+            _global_tokenizer = AutoTokenizer.from_pretrained(model_id)
         
         # Load model
         logger.debug("Loading model (this may take a while)...")
         _global_model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            torch_dtype=torch.float16 if device in ("cuda", "mps") else torch.float32,
-            device_map="auto" if device in ("cuda", "mps") else None,
-            low_cpu_mem_usage=True,
+            **model_kwargs
         )
         
         # Move to device if not using device_map
