@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     
     # Model configuration
     MODEL_ID: str = Field(
-        default="google/medgemma-4b-it",
+        default="google/medgemma-1.5-4b-it",  # Updated default - medgemma-4b-it may not exist
         description="Model identifier (HuggingFace model ID or path)"
     )
     DEVICE: Literal["auto", "cpu", "cuda", "mps"] = Field(
