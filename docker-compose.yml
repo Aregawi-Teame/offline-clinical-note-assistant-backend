@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  backend:
+    build: .
+    container_name: medgemma-backend
+    ports:
+      - "8000:8000"
+    environment:
+      # Override defaults if needed via .env file
+      - ENV=dev
+    env_file:
+      - .env
+    volumes:
+      # Optional: Mount HuggingFace cache to persist downloaded models (read-write for downloads)
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      # Optional: Mount data directory for audit logs
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

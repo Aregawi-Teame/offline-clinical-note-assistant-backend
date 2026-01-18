@@ -1,0 +1,40 @@
+Generate a SOAP note based on the provided clinical information. Follow these strict guidelines:
+
+CRITICAL RULES:
+- Do not add information not present in the input
+- Use "Not provided" for any missing information
+- Minimize PHI (Protected Health Information) - use generic descriptors when possible
+- Be precise and factual only
+
+INPUT DATA:
+{notes}
+
+OUTPUT FORMAT (strict structure, follow exactly):
+
+SUBJECTIVE:
+Chief Complaint: [Only if mentioned in input, otherwise "Not provided"]
+History of Present Illness: [Only information from input, use "Not provided" if missing]
+Review of Systems: [Only if mentioned, otherwise "Not provided"]
+Past Medical History: [Only if mentioned, otherwise "Not provided"]
+Medications: [Only if mentioned, otherwise "Not provided"]
+Allergies: [Only if mentioned, otherwise "Not provided"]
+Social History: [Only if mentioned, otherwise "Not provided"]
+
+OBJECTIVE:
+Vital Signs: [Only if provided in input, use "Not provided" for missing values]
+Physical Examination:
+  - General Appearance: [Only if mentioned, otherwise "Not provided"]
+  - [Other exam findings only if present in input]
+
+ASSESSMENT:
+Primary Diagnosis: [Only if mentioned in input, otherwise "Not provided"]
+Differential Diagnoses: [Only if mentioned, otherwise "Not provided"]
+
+PLAN:
+Treatment Plan: [Only if mentioned in input, otherwise "Not provided"]
+Medications: [Only if specified, otherwise "Not provided"]
+Follow-up: [Only if mentioned, otherwise "Not provided"]
+Patient Education: [Only if mentioned, otherwise "Not provided"]
+
+Clarifying questions (max 3):
+[If critical information is missing, list up to 3 specific questions needed to complete the note. If all information is sufficient, write "None required."]

@@ -1,0 +1,88 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv/
+venv.bak/
+env.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Distribution / Packaging
+dist/
+build/
+*.egg-info/
+*.egg
+wheels/
+pip-wheel-metadata/
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# Data & Database
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Model Cache (HuggingFace)
+.cache/
+models/
+*.bin
+*.safetensors
+
+# Logs
+*.log
+logs/
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre
+.pyre/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keep important files
+!.env.example
+!README.md
+!QUICKSTART.md
+!*.ipynb

@@ -1,0 +1,46 @@
+Generate a discharge summary based on the provided information. Follow these strict guidelines:
+
+CRITICAL RULES:
+- Do not add information not present in the input
+- Use "Not provided" for any missing information
+- Minimize PHI (Protected Health Information) - use generic descriptors when possible
+- Be precise and factual only
+
+INPUT DATA:
+{notes}
+
+OUTPUT FORMAT (strict structure, follow exactly):
+
+ADMISSION INFORMATION:
+Admission Date: [Only if mentioned, otherwise "Not provided"]
+Admitting Diagnosis: [Only if mentioned, otherwise "Not provided"]
+Admitting Service: [Only if mentioned, otherwise "Not provided"]
+
+HOSPITAL COURSE:
+Hospital Course: [Summarize only what is provided in input, use "Not provided" if missing]
+Procedures Performed: [Only if mentioned, otherwise "Not provided"]
+Consultations: [Only if mentioned, otherwise "Not provided"]
+Complications: [Only if mentioned, otherwise "Not provided"]
+
+DISCHARGE INFORMATION:
+Discharge Date: [Only if mentioned, otherwise "Not provided"]
+Discharge Diagnosis: [Only if mentioned, otherwise "Not provided"]
+Discharge Condition: [Only if mentioned, otherwise "Not provided"]
+
+DISCHARGE MEDICATIONS:
+[List only medications mentioned in input. If none mentioned, write "Not provided"]
+[Format: Medication name - Dosage - Frequency - Duration]
+
+DISCHARGE INSTRUCTIONS:
+Activity: [Only if mentioned, otherwise "Not provided"]
+Diet: [Only if mentioned, otherwise "Not provided"]
+Wound Care: [Only if mentioned, otherwise "Not provided"]
+Other Instructions: [Only if mentioned, otherwise "Not provided"]
+
+FOLLOW-UP:
+Primary Care Provider Follow-up: [Only if mentioned, otherwise "Not provided"]
+Specialty Follow-up: [Only if mentioned, otherwise "Not provided"]
+Labs/Imaging Pending: [Only if mentioned, otherwise "Not provided"]
+
+Clarifying questions (max 3):
+[If critical information is missing, list up to 3 specific questions needed to complete the summary. If all information is sufficient, write "None required."]

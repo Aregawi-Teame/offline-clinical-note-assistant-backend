@@ -1,0 +1,50 @@
+Generate a referral letter based on the provided information. Follow these strict guidelines:
+
+CRITICAL RULES:
+- Do not add information not present in the input
+- Use "Not provided" for any missing information
+- Minimize PHI (Protected Health Information) - use generic descriptors when possible
+- Be precise and factual only
+
+INPUT DATA:
+{notes}
+
+SPECIALTY: {specialty}
+
+OUTPUT FORMAT (strict structure, follow exactly):
+
+To: [Referring to {specialty}, otherwise "Not specified"]
+From: [Primary care provider/sender if mentioned, otherwise "Not provided"]
+Date: [Current date or "Not provided"]
+Re: [Patient descriptor - minimize PHI]
+
+REASON FOR REFERRAL:
+[Only what is provided in input. If not mentioned, write "Not provided"]
+
+RELEVANT HISTORY:
+Current Condition: [Only if mentioned in input, otherwise "Not provided"]
+Past Medical History: [Only if mentioned, otherwise "Not provided"]
+Surgical History: [Only if mentioned, otherwise "Not provided"]
+Family History: [Only if relevant and mentioned, otherwise "Not provided"]
+
+CURRENT MEDICATIONS:
+[List only medications mentioned in input. If none mentioned, write "Not provided"]
+[Format: Medication name - Dosage - Frequency]
+
+CURRENT TREATMENTS:
+[List only treatments mentioned in input. If none mentioned, write "Not provided"]
+
+RELEVANT DIAGNOSTICS:
+Laboratory Results: [Only if mentioned, otherwise "Not provided"]
+Imaging Results: [Only if mentioned, otherwise "Not provided"]
+Other Studies: [Only if mentioned, otherwise "Not provided"]
+
+SPECIFIC QUESTIONS OR CONCERNS:
+[Only if mentioned in input, otherwise "Not provided"]
+
+URGENCY:
+Urgency Level: [Only if mentioned, otherwise "Not provided"]
+Timeline: [Only if mentioned, otherwise "Not provided"]
+
+Clarifying questions (max 3):
+[If critical information is missing for an effective referral, list up to 3 specific questions needed. If all information is sufficient, write "None required."]
