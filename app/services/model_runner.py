@@ -397,18 +397,27 @@ None required."""
             logger.info(f"Step 2: Starting model.generate() on device {self.device} with kwargs: {generation_kwargs}")
             logger.debug(f"Model device: {next(_global_model.parameters()).device}")
             logger.info(f"Input tensor device: {inputs['input_ids'].device}")
+            logger.info(f"⏳ Generation may take 2-5 minutes for {max_new_tokens} tokens on T4 GPU. Please wait...")
             
             # Device should already be resolved (MPS -> CPU) in _resolve_device
             # No need for fallback logic - device resolution handles MPS -> CPU conversion
             
             # Generate with torch.no_grad() for efficiency
+            import time
+            generation_start = time.time()
             with torch.no_grad():
                 logger.info(f"Step 3: Calling model.generate() on {self.device} - this may take a while...")
-                outputs = _global_model.generate(
-                    **inputs,
-                    **generation_kwargs
-                )
-                logger.info(f"Generation complete. Output shape: {outputs.shape}")
+                try:
+                    outputs = _global_model.generate(
+                        **inputs,
+                        **generation_kwargs
+                    )
+                    generation_time = time.time() - generation_start
+                    logger.info(f"Generation complete in {generation_time:.1f}s. Output shape: {outputs.shape}")
+                except Exception as gen_error:
+                    generation_time = time.time() - generation_start
+                    logger.error(f"Generation failed after {generation_time:.1f}s: {gen_error}")
+                    raise
             
             logger.debug("Step 4: Decoding output tokens...")
             # Decode the full output
