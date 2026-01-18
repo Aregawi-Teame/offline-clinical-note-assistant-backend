@@ -379,6 +379,7 @@ None required."""
             generation_kwargs = {
                 "max_new_tokens": max_new_tokens,
                 "pad_token_id": _global_tokenizer.pad_token_id or _global_tokenizer.eos_token_id,
+                "repetition_penalty": 1.1,  # Slight penalty to reduce repetition loops
             }
             
             if use_sampling:
@@ -387,12 +388,13 @@ None required."""
                 generation_kwargs["temperature"] = safe_temperature
                 generation_kwargs["top_p"] = max(0.1, min(top_p, 1.0))
                 generation_kwargs["do_sample"] = True
-                logger.debug(f"Using sampling mode: temperature={safe_temperature}, top_p={generation_kwargs['top_p']}")
+                logger.debug(f"Using sampling mode: temperature={safe_temperature}, top_p={generation_kwargs['top_p']}, repetition_penalty={generation_kwargs['repetition_penalty']}")
             else:
                 # Greedy decoding for low/zero temperature (more stable, deterministic)
                 # Don't pass temperature or top_p when using greedy decoding
+                # But we still apply repetition_penalty to avoid loops
                 generation_kwargs["do_sample"] = False
-                logger.debug("Using greedy decoding mode (temperature <= 0.2)")
+                logger.debug(f"Using greedy decoding mode (temperature <= 0.2), repetition_penalty={generation_kwargs['repetition_penalty']}")
             
             logger.info(f"Step 2: Starting model.generate() on device {self.device} with kwargs: {generation_kwargs}")
             logger.debug(f"Model device: {next(_global_model.parameters()).device}")
@@ -434,18 +436,41 @@ None required."""
             if outputs.shape[1] > input_length:
                 logger.debug(f"Method 1 (token slicing): Extracting new tokens (output: {outputs.shape[1]}, input: {input_length})")
                 generated_tokens = outputs[0][input_length:].clone()
-                logger.debug(f"New tokens shape: {generated_tokens.shape}, num_tokens: {len(generated_tokens)}")
+                num_new_tokens = len(generated_tokens)
+                logger.debug(f"New tokens shape: {generated_tokens.shape}, num_tokens: {num_new_tokens}")
                 
+                # Try decoding with skip_special_tokens=True
                 generated_text = _global_tokenizer.decode(
                     generated_tokens,
                     skip_special_tokens=True
                 ).strip()
-                logger.debug(f"Method 1 (token slicing): Generated text length: {len(generated_text)} chars")
+                logger.debug(f"Method 1a (skip_special_tokens=True): Generated text length: {len(generated_text)} chars")
+                
+                # If empty, try without skipping special tokens (sometimes they decode to text)
+                if not generated_text:
+                    logger.debug("Method 1a produced empty text, trying without skip_special_tokens...")
+                    generated_text = _global_tokenizer.decode(
+                        generated_tokens,
+                        skip_special_tokens=False
+                    ).strip()
+                    logger.debug(f"Method 1b (skip_special_tokens=False): Generated text length: {len(generated_text)} chars")
+                
+                # Debug: Show token IDs and what they decode to
+                if not generated_text:
+                    logger.warning(f"Both decoding methods produced empty text from {num_new_tokens} tokens")
+                    # Show first 20 token IDs and their decoded values
+                    sample_tokens = generated_tokens[:min(20, num_new_tokens)]
+                    for i, tok_id in enumerate(sample_tokens):
+                        try:
+                            tok_text = _global_tokenizer.decode([tok_id], skip_special_tokens=False)
+                            logger.debug(f"  Token {i} (ID {tok_id.item()}): '{tok_text}'")
+                        except Exception as e:
+                            logger.debug(f"  Token {i} (ID {tok_id.item()}): decode error - {e}")
                 
                 if generated_text:
                     logger.debug(f"Method 1 succeeded! First 100 chars: {generated_text[:100]}...")
                 else:
-                    logger.warning("Method 1 (token slicing) produced empty text")
+                    logger.warning("Method 1 (token slicing) produced empty text after all attempts")
             
             # FALLBACK METHOD 2: Try exact string match if token slicing failed
             if not generated_text and full_text.startswith(prompt):
