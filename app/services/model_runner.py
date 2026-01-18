@@ -91,7 +91,7 @@ def _load_model_and_tokenizer(model_id: str, device: str) -> tuple[torch.nn.Modu
     try:
         # Get HuggingFace token from environment if available
         import os
-        hf_token = os.environ.get('HUGGINGFACE_HUB_TOKEN') or os.environ.get('HF_TOKEN')
+        hf_token = os.environ.get('HF_TOKEN')
         
         # Prepare model loading kwargs
         model_kwargs = {
