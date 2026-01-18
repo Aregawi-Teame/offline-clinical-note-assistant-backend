@@ -428,48 +428,65 @@ None required."""
             # Strip the prompt to return only generated text
             logger.info("Step 5: Stripping prompt from generated text...")
             
-            # Method 1: Try exact match first
-            if full_text.startswith(prompt):
-                generated_text = full_text[len(prompt):].strip()
-                logger.debug(f"Method 1 (exact match): Stripped successfully. Generated text length: {len(generated_text)} chars")
-            else:
-                # Method 2: Decode only the new tokens (more reliable)
-                logger.debug(f"Method 1 failed: full_text doesn't start with prompt exactly")
-                logger.debug(f"Full text starts with: {full_text[:100]}...")
-                logger.debug(f"Prompt starts with: {prompt[:100]}...")
-                logger.debug(f"Trying Method 2: Decoding only new tokens (output length: {outputs.shape[1]}, input length: {input_length})")
+            # PRIMARY METHOD: Decode only the new tokens (most reliable)
+            # This avoids issues with tokenizer decoding differences
+            generated_text = ""
+            if outputs.shape[1] > input_length:
+                logger.debug(f"Method 1 (token slicing): Extracting new tokens (output: {outputs.shape[1]}, input: {input_length})")
+                generated_tokens = outputs[0][input_length:].clone()
+                logger.debug(f"New tokens shape: {generated_tokens.shape}, num_tokens: {len(generated_tokens)}")
                 
-                if outputs.shape[1] > input_length:
-                    generated_tokens = outputs[0][input_length:]
-                    generated_text = _global_tokenizer.decode(
-                        generated_tokens,
-                        skip_special_tokens=True
-                    ).strip()
-                    logger.debug(f"Method 2 (token slicing): Generated text length: {len(generated_text)} chars")
+                generated_text = _global_tokenizer.decode(
+                    generated_tokens,
+                    skip_special_tokens=True
+                ).strip()
+                logger.debug(f"Method 1 (token slicing): Generated text length: {len(generated_text)} chars")
+                
+                if generated_text:
+                    logger.debug(f"Method 1 succeeded! First 100 chars: {generated_text[:100]}...")
                 else:
-                    logger.warning(f"Output length ({outputs.shape[1]}) <= input length ({input_length}), cannot extract new tokens")
-                    # Fallback: Try to find prompt in text and extract after it
-                    prompt_index = full_text.find(prompt)
-                    if prompt_index >= 0:
-                        generated_text = full_text[prompt_index + len(prompt):].strip()
-                        logger.debug(f"Method 3 (find prompt): Found prompt at index {prompt_index}, generated text length: {len(generated_text)} chars")
-                    else:
-                        # Last resort: Return everything if we can't find the prompt
-                        logger.warning("Could not find prompt in generated text, returning full text as fallback")
-                        generated_text = full_text.strip()
+                    logger.warning("Method 1 (token slicing) produced empty text")
             
-            if not generated_text or len(generated_text) == 0:
-                logger.error(f"⚠️ Generated text is empty after stripping!")
-                logger.error(f"Full text length: {len(full_text)}")
-                logger.error(f"Prompt length: {len(prompt)}")
-                logger.error(f"Output shape: {outputs.shape}")
-                logger.error(f"Input length: {input_length}")
-                # Last resort: return a portion of the full text
+            # FALLBACK METHOD 2: Try exact string match if token slicing failed
+            if not generated_text and full_text.startswith(prompt):
+                logger.debug("Method 2 (exact match): Trying string-based stripping")
+                generated_text = full_text[len(prompt):].strip()
+                logger.debug(f"Method 2 (exact match): Generated text length: {len(generated_text)} chars")
+            
+            # FALLBACK METHOD 3: Try finding prompt in text
+            if not generated_text:
+                logger.debug("Method 3 (find prompt): Trying to find prompt in decoded text")
+                prompt_index = full_text.find(prompt)
+                if prompt_index >= 0:
+                    generated_text = full_text[prompt_index + len(prompt):].strip()
+                    logger.debug(f"Method 3 (find prompt): Found at index {prompt_index}, generated text length: {len(generated_text)} chars")
+            
+            # FALLBACK METHOD 4: If all else fails and we have more tokens than input, something is wrong
+            if not generated_text:
+                logger.error(f"⚠️ All methods failed to extract generated text!")
+                logger.error(f"   Full text length: {len(full_text)}")
+                logger.error(f"   Prompt length: {len(prompt)}")
+                logger.error(f"   Output shape: {outputs.shape}")
+                logger.error(f"   Input length: {input_length}")
+                logger.error(f"   Expected new tokens: {outputs.shape[1] - input_length}")
+                
+                # Debug: Check what the new tokens decode to
+                if outputs.shape[1] > input_length:
+                    debug_tokens = outputs[0][input_length:input_length+10]  # First 10 new tokens
+                    debug_text = _global_tokenizer.decode(debug_tokens, skip_special_tokens=True)
+                    logger.error(f"   First 10 new tokens decode to: '{debug_text}'")
+                
+                # Last resort: Return full text minus a best-guess prompt length
                 if len(full_text) > len(prompt):
-                    generated_text = full_text[-min(1000, len(full_text) - len(prompt)):].strip()
-                    logger.warning(f"Using fallback: returning last portion of full text ({len(generated_text)} chars)")
+                    generated_text = full_text[len(prompt):].strip()
+                    logger.warning(f"Using last-resort fallback: returning text after prompt ({len(generated_text)} chars)")
                 else:
-                    raise RuntimeError("Generated text is empty - model may not have generated any new tokens")
+                    raise RuntimeError(
+                        f"Generated text is empty - model may not have generated any new tokens. "
+                        f"Output has {outputs.shape[1]} tokens, input has {input_length} tokens, "
+                        f"but decoded text ({len(full_text)} chars) equals prompt length ({len(prompt)} chars). "
+                        f"This suggests the model repeated the prompt exactly."
+                    )
             
             logger.info(f"Inference complete. Generated text length: {len(generated_text)} characters")
             return generated_text
