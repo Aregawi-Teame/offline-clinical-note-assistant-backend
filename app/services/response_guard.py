@@ -40,6 +40,14 @@ PHI_PATTERNS = [
     (r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', '[REDACTED_PHONE]'),  # 123-456-7890, 123.456.7890, 1234567890
     (r'\(\d{3}\)\s?\d{3}[-.]?\d{4}', '[REDACTED_PHONE]'),  # (123) 456-7890
     (r'\b\d{10}\b', '[REDACTED_PHONE]'),  # 10 consecutive digits
+    # Social Security Numbers (SSN)
+    (r'\b\d{3}-\d{2}-\d{4}\b', '[REDACTED_SSN]'),  # 123-45-6789
+    (r'\b\d{3}\s\d{2}\s\d{4}\b', '[REDACTED_SSN]'),  # 123 45 6789
+    (r'\b\d{9}\b', '[REDACTED_SSN]'),  # 123456789 (9 consecutive digits - potential SSN)
+    # Dates of Birth (DOB) - common formats
+    (r'\b\d{1,2}/\d{1,2}/\d{4}\b', '[REDACTED_DOB]'),  # MM/DD/YYYY or M/D/YYYY
+    (r'\b\d{4}-\d{2}-\d{2}\b', '[REDACTED_DOB]'),  # YYYY-MM-DD (ISO format)
+    (r'\b\d{1,2}-\d{1,2}-\d{4}\b', '[REDACTED_DOB]'),  # MM-DD-YYYY or M-D-YYYY
 ]
 
 
@@ -57,6 +65,7 @@ class ResponseGuard:
         """
         self.model_runner = model_runner
         self.min_length = 50
+        self._repair_attempted = False  # Prevent infinite recursion in format repair
     
     def validate(
         self,
@@ -93,27 +102,35 @@ class ResponseGuard:
         missing_sections = self._check_required_sections(cleaned, task)
         
         # Step 4: Attempt repair if sections are missing and model_runner is available
-        if missing_sections and self.model_runner is not None and original_prompt:
+        # Prevent infinite recursion: only attempt repair once per validation call
+        if missing_sections and self.model_runner is not None and original_prompt and not self._repair_attempted:
             logger.warning(
                 f"Missing required sections for {task.value}: {missing_sections}. "
-                "Attempting format repair..."
+                "Attempting format repair (one-time attempt)..."
             )
-            repaired = self._attempt_format_repair(cleaned, original_prompt)
-            if repaired:
-                # Re-check sections after repair
-                still_missing = self._check_required_sections(repaired, task)
-                if not still_missing:
-                    cleaned = repaired
-                    logger.info("Format repair successful")
+            self._repair_attempted = True  # Prevent recursion
+            try:
+                repaired = self._attempt_format_repair(cleaned, original_prompt)
+                if repaired:
+                    # Re-check sections after repair
+                    still_missing = self._check_required_sections(repaired, task)
+                    if not still_missing:
+                        cleaned = repaired
+                        logger.info("Format repair successful")
+                    else:
+                        logger.warning(f"Format repair did not fix all sections. Still missing: {still_missing}")
                 else:
-                    logger.warning(f"Format repair did not fix all sections. Still missing: {still_missing}")
-            else:
-                logger.warning("Format repair failed or unavailable")
+                    logger.warning("Format repair failed or unavailable")
+            finally:
+                self._repair_attempted = False  # Reset for next validation call
         elif missing_sections:
-            logger.warning(
-                f"Missing required sections for {task.value}: {missing_sections}. "
-                "Repair unavailable (no model_runner provided)."
-            )
+            if self._repair_attempted:
+                logger.warning(f"Missing sections but repair already attempted, skipping to avoid recursion")
+            else:
+                logger.warning(
+                    f"Missing required sections for {task.value}: {missing_sections}. "
+                    "Repair unavailable (no model_runner provided)."
+                )
         
         # Step 3.5: If sections are missing but we have meaningful content, 
         # log a warning but don't fail validation yet (will check at final validation)
@@ -396,6 +413,22 @@ class ResponseGuard:
                     logger.debug(f"Found medical keyword(s): {found_keywords[:3]}... (total: {len(found_keywords)})")
                     return True
         
+        # For short responses (10-50 words), be even more lenient
+        # Short clinical notes like "Patient stable." are valid
+        if word_count >= 10:
+            text_lower = text.lower()
+            # Accept if it has sentence structure OR contains any medical keyword
+            sentences = text.count('.') + text.count('!') + text.count('?')
+            if sentences >= 1:  # Has at least one sentence
+                medical_keywords = [
+                    "patient", "stable", "improved", "follow-up", "visit", "examination",
+                    "assessment", "plan", "medication", "diagnosis", "treatment"
+                ]
+                found_keywords = [kw for kw in medical_keywords if kw in text_lower]
+                if len(found_keywords) >= 1:  # Only need 1 keyword for short notes
+                    logger.debug(f"Short response ({word_count} words) with sentence structure and keyword(s): {found_keywords}")
+                    return True
+        
         # Check for common medical note indicators (for shorter responses)
         medical_keywords = [
             "patient", "diagnosis", "treatment", "history", "examination",
@@ -406,16 +439,27 @@ class ResponseGuard:
             "care", "health", "doctor", "physician", "hospital", "visit"
         ]
         
+        # Check for common medical note indicators (for shortest responses)
+        # Be lenient: only need 1 keyword for very short responses (5-10 words)
+        # Examples: "Patient stable.", "Follow-up needed."
         text_lower = text.lower()
         found_keywords = [kw for kw in medical_keywords if kw in text_lower]
-        has_keywords = len(found_keywords) >= 2
+        
+        # For very short responses (5-10 words), only need 1 keyword
+        # For slightly longer (10+ words already handled above), need 2
+        if word_count < 10:
+            has_keywords = len(found_keywords) >= 1
+            threshold = 1
+        else:
+            has_keywords = len(found_keywords) >= 2
+            threshold = 2
         
         if has_keywords:
-            logger.debug(f"Found medical keywords: {found_keywords[:5]}... (total: {len(found_keywords)})")
+            logger.debug(f"Found medical keywords: {found_keywords[:5]}... (total: {len(found_keywords)}, needed: {threshold})")
         else:
             logger.debug(
                 f"Medical keyword check failed: found {len(found_keywords)} keywords ({found_keywords[:3]}), "
-                f"need at least 2. Text sample: {text[:100]}"
+                f"need at least {threshold}. Text sample: {text[:100]}"
             )
         
         return has_keywords

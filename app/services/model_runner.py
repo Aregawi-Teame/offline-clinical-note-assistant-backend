@@ -94,8 +94,12 @@ def _load_model_and_tokenizer(model_id: str, device: str) -> tuple[torch.nn.Modu
         hf_token = os.environ.get('HF_TOKEN')
         
         # Prepare model loading kwargs
+        # Use device_map="auto" for CUDA to let HuggingFace handle device placement
+        # For CPU, use .to(device) after loading (simpler and more reliable)
+        use_device_map = device == "cuda"
+        
         model_kwargs = {
-            "torch_dtype": torch.float16 if device in ("cuda", "mps") else torch.float32,
+            "torch_dtype": torch.float16 if device == "cuda" else torch.float32,
             "low_cpu_mem_usage": True,
         }
         
@@ -104,9 +108,10 @@ def _load_model_and_tokenizer(model_id: str, device: str) -> tuple[torch.nn.Modu
             model_kwargs["token"] = hf_token
             logger.debug("Using HuggingFace token for authentication")
         
-        # Add device_map for CUDA/MPS
-        if device in ("cuda", "mps"):
+        # Add device_map only for CUDA (let HuggingFace handle device placement)
+        if use_device_map:
             model_kwargs["device_map"] = "auto"
+            logger.debug("Using device_map='auto' for CUDA device placement")
         
         # Load tokenizer
         logger.debug("Loading tokenizer...")
@@ -122,9 +127,13 @@ def _load_model_and_tokenizer(model_id: str, device: str) -> tuple[torch.nn.Modu
             **model_kwargs
         )
         
-        # Move to device if not using device_map
-        if device not in ("cuda", "mps") or not hasattr(_global_model, "hf_device_map"):
+        # Only move to device manually if NOT using device_map (i.e., for CPU)
+        # Using device_map="auto" and .to(device) together causes RuntimeError
+        if not use_device_map:
             _global_model = _global_model.to(device)
+            logger.debug(f"Manually moved model to {device}")
+        else:
+            logger.debug("Model device placement handled by device_map='auto'")
         
         # Set model to evaluation mode
         _global_model.eval()
@@ -366,9 +375,20 @@ None required."""
         try:
             # Tokenize input
             logger.debug("Step 1: Tokenizing input prompt...")
+            # Tokenize and move to device
+            # Note: attention_mask is automatically included in inputs dict
             inputs = _global_tokenizer(prompt, return_tensors="pt").to(self.device)
             input_length = inputs["input_ids"].shape[1]
+            
+            # Log tokenization details for debugging BOS/EOS token issues
+            # Check if BOS token was added (some tokenizers add it, some don't)
+            if hasattr(_global_tokenizer, 'bos_token_id') and _global_tokenizer.bos_token_id is not None:
+                first_token_id = inputs["input_ids"][0, 0].item()
+                if first_token_id == _global_tokenizer.bos_token_id:
+                    logger.debug(f"BOS token detected at start of input (token_id: {first_token_id})")
+            
             logger.debug(f"Tokenization complete. Input shape: {inputs['input_ids'].shape}, input_length={input_length}")
+            logger.debug(f"Attention mask shape: {inputs.get('attention_mask', 'not provided').shape if hasattr(inputs.get('attention_mask', None), 'shape') else 'not provided'}")
             
             # Prepare generation kwargs
             # For low temperatures (<= 0.2), use greedy decoding to avoid numerical issues
@@ -433,7 +453,7 @@ None required."""
                     raise
             
             logger.debug("Step 4: Decoding output tokens...")
-            # Decode the full output
+            # Decode the full output once (cache for fallback methods)
             full_text = _global_tokenizer.decode(outputs[0], skip_special_tokens=True)
             logger.debug(f"Decoding complete. Full text length: {len(full_text)} chars")
             logger.debug(f"Prompt length: {len(prompt)} chars, Input tokens: {input_length}")
@@ -443,12 +463,27 @@ None required."""
             
             # PRIMARY METHOD: Decode only the new tokens (most reliable)
             # This avoids issues with tokenizer decoding differences
+            # Note: We use input_length directly - the model.generate() output includes
+            # the input tokens + generated tokens, so slicing at input_length gives us only generated tokens
+            # If BOS token was added by tokenizer, it's already in input_length count
             generated_text = ""
             if outputs.shape[1] > input_length:
                 logger.debug(f"Method 1 (token slicing): Extracting new tokens (output: {outputs.shape[1]}, input: {input_length})")
+                
+                # Extract only new tokens (everything after input_length)
+                # Note: input_length already accounts for BOS if tokenizer added it
                 generated_tokens = outputs[0][input_length:].clone()
                 num_new_tokens = len(generated_tokens)
                 logger.debug(f"New tokens shape: {generated_tokens.shape}, num_tokens: {num_new_tokens}")
+                
+                # Check if first generated token is BOS (unlikely but possible)
+                # This would indicate the model generated BOS as first token (shouldn't happen)
+                if hasattr(_global_tokenizer, 'bos_token_id') and _global_tokenizer.bos_token_id is not None:
+                    first_gen_token = generated_tokens[0].item() if len(generated_tokens) > 0 else None
+                    if first_gen_token == _global_tokenizer.bos_token_id:
+                        logger.warning(f"First generated token is BOS (token_id: {first_gen_token}) - skipping it")
+                        generated_tokens = generated_tokens[1:]  # Skip BOS if model generated it
+                        num_new_tokens = len(generated_tokens)
                 
                 # Get special token IDs to filter out
                 pad_token_id = _global_tokenizer.pad_token_id
