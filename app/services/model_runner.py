@@ -515,14 +515,36 @@ None required."""
             
             logger.info(f"Inference complete. Generated text length: {len(generated_text)} characters")
             
-            # Log a sample of the generated text for debugging (first 500 chars)
+            # Log a sample of the generated text for debugging (CRITICAL for troubleshooting)
             if generated_text:
+                # Calculate statistics
+                word_count = len(generated_text.split())
+                char_count = len(generated_text)
+                non_whitespace_count = len([c for c in generated_text if not c.isspace()])
+                sentences = generated_text.count('.') + generated_text.count('!') + generated_text.count('?')
+                
+                logger.info(
+                    f"Generated text stats: {char_count} chars, {word_count} words, "
+                    f"{non_whitespace_count} non-whitespace chars, {sentences} sentences"
+                )
+                
+                # Log samples at INFO level so they always show up
                 sample = generated_text[:500].replace('\n', '\\n')
-                logger.debug(f"Generated text sample (first 500 chars): {sample}")
+                logger.info(f"📝 Generated text sample (first 500 chars): {sample}")
+                
                 # Also log the last 200 chars to see how it ends
                 if len(generated_text) > 500:
                     end_sample = generated_text[-200:].replace('\n', '\\n')
-                    logger.debug(f"Generated text sample (last 200 chars): ...{end_sample}")
+                    logger.info(f"📝 Generated text sample (last 200 chars): ...{end_sample}")
+                
+                # Check if text looks suspicious (mostly whitespace or special chars)
+                if non_whitespace_count < char_count * 0.3:  # Less than 30% non-whitespace
+                    logger.warning(
+                        f"⚠️  Generated text has high whitespace ratio: "
+                        f"{non_whitespace_count}/{char_count} ({non_whitespace_count/char_count*100:.1f}%) non-whitespace"
+                    )
+            else:
+                logger.warning("⚠️  Generated text is empty after stripping!")
             
             return generated_text
             

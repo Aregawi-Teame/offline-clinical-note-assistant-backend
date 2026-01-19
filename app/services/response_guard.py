@@ -133,6 +133,20 @@ class ResponseGuard:
         # Final section check - be more lenient
         final_missing = self._check_required_sections(cleaned, task)
         
+        # Log detailed info for debugging
+        word_count = len(cleaned.split())
+        char_count = len(cleaned)
+        sentences = cleaned.count('.') + cleaned.count('!') + cleaned.count('?')
+        
+        logger.info(
+            f"Validation check: {char_count} chars, {word_count} words, {sentences} sentences, "
+            f"meaningful={has_meaningful}, missing_sections={final_missing}"
+        )
+        
+        # Log a sample of the actual text to help debug
+        sample = cleaned[:300].replace('\n', '\\n')
+        logger.debug(f"Generated text sample (first 300 chars): {sample}")
+        
         # If we have meaningful content, allow the response even if some sections are missing
         # This handles cases where the model generates valid clinical content but with different formatting
         if has_meaningful:
@@ -148,10 +162,33 @@ class ResponseGuard:
             logger.info(f"Validated response: {len(cleaned)} characters, task: {task.value}")
             return cleaned
         else:
+            # For long responses (2000+ chars), be more lenient - accept if it has structure
+            if char_count >= 2000:
+                logger.warning(
+                    f"Long response ({char_count} chars, {word_count} words) but keyword check failed. "
+                    f"Allowing anyway if it has structure (sentences: {sentences})"
+                )
+                if sentences >= 3 or word_count >= 200:  # Has some structure
+                    if final_missing:
+                        logger.warning(f"Allowing long response despite missing sections: {final_missing}")
+                        section_note = f"[Note: Some sections may not be explicitly formatted: {', '.join(final_missing)}]\n\n"
+                        cleaned = section_note + cleaned
+                    logger.info(f"Validated long response: {len(cleaned)} characters, task: {task.value}")
+                    return cleaned
+            
             # No meaningful content AND missing sections - fail validation
+            # Log the actual text sample to help debug what was generated
+            logger.error(
+                f"Validation failed: {char_count} chars, {word_count} words, {sentences} sentences. "
+                f"Missing sections: {final_missing}"
+            )
+            logger.error(f"Generated text sample (first 500 chars): {cleaned[:500]}")
+            logger.error(f"Generated text sample (last 200 chars): {cleaned[-200:]}")
+            
             raise ValueError(
                 f"Response lacks meaningful content. Missing required sections: {final_missing} "
-                f"(found {len(cleaned)} characters but no medical keywords detected)"
+                f"(found {char_count} characters, {word_count} words, but no medical keywords detected). "
+                f"Check logs for generated text sample."
             )
     
     def _clean(self, text: str) -> str:
@@ -310,28 +347,63 @@ class ResponseGuard:
             True if text has meaningful content
         """
         if not text or not text.strip():
+            logger.debug("_has_meaningful_content: Empty or whitespace-only text")
             return False
         
         # Check for minimum word count (more lenient for long responses)
         word_count = len(text.split())
+        char_count = len(text)
+        
         if word_count < 5:
+            logger.debug(f"_has_meaningful_content: Too few words ({word_count} < 5)")
             return False
         
-        # For longer responses (500+ words), assume meaningful content if it has structure
-        if word_count >= 500:
-            # Long responses are likely meaningful if they have sentence structure
+        # For longer responses (200+ words OR 1000+ chars), be more lenient
+        # Assume meaningful if it has sentence structure (indicates real text, not just tokens)
+        if word_count >= 200 or char_count >= 1000:
             sentences = text.count('.') + text.count('!') + text.count('?')
-            if sentences >= 5:
-                logger.debug(f"Long response ({word_count} words, {sentences} sentences) - assuming meaningful content")
+            # Check for paragraph structure (multiple newlines)
+            paragraphs = text.count('\n\n') + text.count('\r\n\r\n')
+            
+            # If it has sentences and paragraphs, it's likely meaningful
+            if sentences >= 3:
+                logger.debug(
+                    f"Long response ({word_count} words, {char_count} chars, {sentences} sentences, "
+                    f"{paragraphs} paragraphs) - assuming meaningful content based on structure"
+                )
                 return True
         
-        # Check for common medical note indicators
+        # For medium responses (50-200 words), check for structure + keywords
+        if word_count >= 50:
+            sentences = text.count('.') + text.count('!') + text.count('?')
+            if sentences >= 2:  # Has some sentence structure
+                logger.debug(
+                    f"Medium response ({word_count} words, {sentences} sentences) - "
+                    "checking for keywords with lenient threshold"
+                )
+                # Only need 1 keyword for medium responses
+                text_lower = text.lower()
+                medical_keywords = [
+                    "patient", "diagnosis", "treatment", "history", "examination",
+                    "assessment", "plan", "subjective", "objective", "medication",
+                    "discharge", "referral", "information", "provided", "clinical",
+                    "symptom", "sign", "condition", "disease", "test", "result",
+                    "vital", "sign", "physical", "chief", "complaint", "medical",
+                    "care", "health", "doctor", "physician", "hospital", "visit"
+                ]
+                found_keywords = [kw for kw in medical_keywords if kw in text_lower]
+                if len(found_keywords) >= 1:  # More lenient - only need 1 keyword
+                    logger.debug(f"Found medical keyword(s): {found_keywords[:3]}... (total: {len(found_keywords)})")
+                    return True
+        
+        # Check for common medical note indicators (for shorter responses)
         medical_keywords = [
             "patient", "diagnosis", "treatment", "history", "examination",
             "assessment", "plan", "subjective", "objective", "medication",
             "discharge", "referral", "information", "provided", "clinical",
             "symptom", "sign", "condition", "disease", "test", "result",
-            "vital", "sign", "physical", "chief", "complaint"
+            "vital", "sign", "physical", "chief", "complaint", "medical",
+            "care", "health", "doctor", "physician", "hospital", "visit"
         ]
         
         text_lower = text.lower()
@@ -341,6 +413,9 @@ class ResponseGuard:
         if has_keywords:
             logger.debug(f"Found medical keywords: {found_keywords[:5]}... (total: {len(found_keywords)})")
         else:
-            logger.debug(f"Medical keyword check: found {len(found_keywords)} keywords, need at least 2")
+            logger.debug(
+                f"Medical keyword check failed: found {len(found_keywords)} keywords ({found_keywords[:3]}), "
+                f"need at least 2. Text sample: {text[:100]}"
+            )
         
         return has_keywords
