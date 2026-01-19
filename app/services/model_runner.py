@@ -376,11 +376,22 @@ None required."""
             # Temperature 0.2 is default, so we use greedy by default (more stable)
             use_sampling = temperature > 0.2
             
+            # Get token IDs - use eos_token_id for padding if pad_token_id is None
+            eos_token_id = _global_tokenizer.eos_token_id
+            pad_token_id = _global_tokenizer.pad_token_id
+            
+            # Prefer eos_token_id for padding to avoid generating pad tokens
+            # Only use pad_token_id if eos_token_id is None
+            effective_pad_token = pad_token_id if pad_token_id is not None else eos_token_id
+            
             generation_kwargs = {
                 "max_new_tokens": max_new_tokens,
-                "pad_token_id": _global_tokenizer.pad_token_id or _global_tokenizer.eos_token_id,
+                "pad_token_id": effective_pad_token,
+                "eos_token_id": eos_token_id,  # Explicitly set EOS token to stop generation properly
                 "repetition_penalty": 1.1,  # Slight penalty to reduce repetition loops
             }
+            
+            logger.debug(f"Generation token IDs: pad_token_id={pad_token_id}, eos_token_id={eos_token_id}, effective_pad_token={effective_pad_token}")
             
             if use_sampling:
                 # Ensure temperature is within safe range for sampling
@@ -439,33 +450,77 @@ None required."""
                 num_new_tokens = len(generated_tokens)
                 logger.debug(f"New tokens shape: {generated_tokens.shape}, num_tokens: {num_new_tokens}")
                 
-                # Try decoding with skip_special_tokens=True
-                generated_text = _global_tokenizer.decode(
-                    generated_tokens,
-                    skip_special_tokens=True
-                ).strip()
-                logger.debug(f"Method 1a (skip_special_tokens=True): Generated text length: {len(generated_text)} chars")
+                # Get special token IDs to filter out
+                pad_token_id = _global_tokenizer.pad_token_id
+                eos_token_id = _global_tokenizer.eos_token_id
+                bos_token_id = _global_tokenizer.bos_token_id
+                unk_token_id = _global_tokenizer.unk_token_id
                 
-                # If empty, try without skipping special tokens (sometimes they decode to text)
-                if not generated_text:
-                    logger.debug("Method 1a produced empty text, trying without skip_special_tokens...")
+                # Collect all special token IDs (excluding None)
+                special_token_ids = set()
+                for token_id in [pad_token_id, eos_token_id, bos_token_id, unk_token_id]:
+                    if token_id is not None:
+                        special_token_ids.add(token_id)
+                
+                # Log first few token IDs for debugging
+                sample_ids = generated_tokens[:min(10, num_new_tokens)].tolist()
+                logger.debug(f"First 10 generated token IDs: {sample_ids}")
+                
+                # Filter out special tokens before decoding
+                # Convert to list, filter, then back to tensor
+                token_list = generated_tokens.tolist()
+                filtered_tokens = [tok_id for tok_id in token_list if tok_id not in special_token_ids]
+                
+                if len(filtered_tokens) == 0:
+                    logger.error(f"⚠️  All {num_new_tokens} generated tokens are special tokens (pad/eos/bos/unk). Model generated no meaningful content!")
+                    # Check what tokens were generated
+                    unique_tokens = set(token_list)
+                    logger.error(f"   Unique token IDs generated: {unique_tokens}")
+                    if pad_token_id and pad_token_id in unique_tokens:
+                        logger.error(f"   Model generated pad_token_id ({pad_token_id}) repeatedly - this should not happen!")
+                        logger.error(f"   Possible causes: model config issue, or generation hit max_new_tokens with padding")
+                    if eos_token_id and eos_token_id in unique_tokens:
+                        logger.warning(f"   Model generated eos_token_id ({eos_token_id}) - generation may have ended immediately")
+                    # Don't decode - will trigger empty text handling below
+                    generated_text = ""
+                else:
+                    # Decode filtered tokens
+                    logger.debug(f"Filtered {len(filtered_tokens)}/{num_new_tokens} tokens (removed {num_new_tokens - len(filtered_tokens)} special tokens)")
+                    filtered_tensor = torch.tensor(filtered_tokens, device=generated_tokens.device)
+                    
+                    # Decode filtered tokens
+                    generated_text = _global_tokenizer.decode(
+                        filtered_tensor,
+                        skip_special_tokens=True
+                    ).strip()
+                    logger.debug(f"Method 1 (filtered): Generated text length: {len(generated_text)} chars")
+                
+                # If still empty after filtering, try decoding original tokens with skip_special_tokens
+                if not generated_text and len(filtered_tokens) > 0:
+                    logger.debug("Filtered decoding produced empty text, trying original tokens with skip_special_tokens...")
                     generated_text = _global_tokenizer.decode(
                         generated_tokens,
-                        skip_special_tokens=False
+                        skip_special_tokens=True
                     ).strip()
-                    logger.debug(f"Method 1b (skip_special_tokens=False): Generated text length: {len(generated_text)} chars")
+                    logger.debug(f"Method 1b (skip_special_tokens=True on original): Generated text length: {len(generated_text)} chars")
                 
-                # Debug: Show token IDs and what they decode to
+                # Debug: Show token IDs and what they decode to if still empty
                 if not generated_text:
-                    logger.warning(f"Both decoding methods produced empty text from {num_new_tokens} tokens")
+                    logger.warning(f"⚠️  All decoding methods produced empty text from {num_new_tokens} new tokens")
+                    # Check if all tokens are pad/special tokens
+                    if len(filtered_tokens) == 0:
+                        logger.error(f"   ERROR: All {num_new_tokens} tokens are special tokens - model generated no content!")
                     # Show first 20 token IDs and their decoded values
                     sample_tokens = generated_tokens[:min(20, num_new_tokens)]
+                    logger.debug("   First 20 token IDs and their decoded values:")
                     for i, tok_id in enumerate(sample_tokens):
                         try:
+                            tok_id_val = tok_id.item()
                             tok_text = _global_tokenizer.decode([tok_id], skip_special_tokens=False)
-                            logger.debug(f"  Token {i} (ID {tok_id.item()}): '{tok_text}'")
+                            is_special = tok_id_val in special_token_ids if special_token_ids else False
+                            logger.debug(f"     Token {i}: ID={tok_id_val}, text='{tok_text[:50]}', is_special={is_special}")
                         except Exception as e:
-                            logger.debug(f"  Token {i} (ID {tok_id.item()}): decode error - {e}")
+                            logger.debug(f"     Token {i} (ID {tok_id.item()}): decode error - {e}")
                 
                 if generated_text:
                     logger.debug(f"Method 1 succeeded! First 100 chars: {generated_text[:100]}...")
@@ -512,6 +567,25 @@ None required."""
                         f"but decoded text ({len(full_text)} chars) equals prompt length ({len(prompt)} chars). "
                         f"This suggests the model repeated the prompt exactly."
                     )
+            
+            # Check if generated text is just pad tokens or special token strings
+            if generated_text:
+                # Check if text is all pad tokens (common issue)
+                stripped_text = generated_text.strip()
+                if stripped_text.replace('<pad>', '').strip() == '' or stripped_text.replace('<pad>', '').strip() == '':
+                    logger.error(f"⚠️  Generated text is all pad tokens: '{generated_text[:100]}...'")
+                    generated_text = ""  # Reset to empty so it triggers proper error handling
+                elif '<pad>' in generated_text and len(stripped_text.replace('<pad>', '').strip()) < 10:
+                    # Mostly pad tokens with a little actual content
+                    logger.warning(f"⚠️  Generated text is mostly pad tokens, removing them...")
+                    # Remove pad token strings
+                    cleaned = generated_text.replace('<pad>', '').replace('<PAD>', '').replace('</s>', '').replace('<|endoftext|>', '').strip()
+                    if cleaned and len(cleaned) > 10:
+                        logger.info(f"   Cleaned pad tokens, remaining text: {len(cleaned)} chars")
+                        generated_text = cleaned
+                    else:
+                        logger.warning("   After removing pad tokens, text is too short, treating as empty")
+                        generated_text = ""
             
             logger.info(f"Inference complete. Generated text length: {len(generated_text)} characters")
             
