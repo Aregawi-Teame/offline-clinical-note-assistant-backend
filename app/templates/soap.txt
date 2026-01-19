@@ -5,11 +5,13 @@ CRITICAL RULES:
 - Use "Not provided" for any missing information
 - Minimize PHI (Protected Health Information) - use generic descriptors when possible
 - Be precise and factual only
+- MUST use the exact section headers in UPPERCASE with colons: SUBJECTIVE:, OBJECTIVE:, ASSESSMENT:, PLAN:
 
 INPUT DATA:
 {notes}
 
 OUTPUT FORMAT (strict structure, follow exactly):
+You MUST start each section with the exact header in UPPERCASE followed by a colon:
 
 SUBJECTIVE:
 Chief Complaint: [Only if mentioned in input, otherwise "Not provided"]

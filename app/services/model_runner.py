@@ -514,6 +514,16 @@ None required."""
                     )
             
             logger.info(f"Inference complete. Generated text length: {len(generated_text)} characters")
+            
+            # Log a sample of the generated text for debugging (first 500 chars)
+            if generated_text:
+                sample = generated_text[:500].replace('\n', '\\n')
+                logger.debug(f"Generated text sample (first 500 chars): {sample}")
+                # Also log the last 200 chars to see how it ends
+                if len(generated_text) > 500:
+                    end_sample = generated_text[-200:].replace('\n', '\\n')
+                    logger.debug(f"Generated text sample (last 200 chars): ...{end_sample}")
+            
             return generated_text
             
         except RuntimeError as e:

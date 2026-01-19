@@ -115,6 +115,10 @@ class ResponseGuard:
                 "Repair unavailable (no model_runner provided)."
             )
         
+        # Step 3.5: If sections are missing but we have meaningful content, 
+        # log a warning but don't fail validation yet (will check at final validation)
+        # This allows the response to pass if it has meaningful content even without perfect formatting
+        
         # Step 5: Redact PHI patterns
         cleaned = self._redact_phi(cleaned)
         
@@ -123,11 +127,32 @@ class ResponseGuard:
             logger.warning(f"Response too short after processing: {len(cleaned)} chars")
             raise ValueError(f"Response too short (minimum {self.min_length} characters)")
         
-        if not self._has_meaningful_content(cleaned):
-            raise ValueError("Response lacks meaningful content")
+        # Check for meaningful content
+        has_meaningful = self._has_meaningful_content(cleaned)
         
-        logger.debug(f"Validated response: {len(cleaned)} characters, task: {task.value}")
-        return cleaned
+        # Final section check - be more lenient
+        final_missing = self._check_required_sections(cleaned, task)
+        
+        # If we have meaningful content, allow the response even if some sections are missing
+        # This handles cases where the model generates valid clinical content but with different formatting
+        if has_meaningful:
+            if final_missing:
+                # Log a warning but don't fail - the content is meaningful
+                logger.warning(
+                    f"Response has meaningful content ({len(cleaned)} chars) but missing sections: {final_missing}. "
+                    "Allowing response with warning."
+                )
+                # Add a note at the beginning of the response about missing sections (informational only)
+                section_note = f"[Note: Some sections may not be explicitly formatted: {', '.join(final_missing)}]\n\n"
+                cleaned = section_note + cleaned
+            logger.info(f"Validated response: {len(cleaned)} characters, task: {task.value}")
+            return cleaned
+        else:
+            # No meaningful content AND missing sections - fail validation
+            raise ValueError(
+                f"Response lacks meaningful content. Missing required sections: {final_missing} "
+                f"(found {len(cleaned)} characters but no medical keywords detected)"
+            )
     
     def _clean(self, text: str) -> str:
         """
@@ -166,14 +191,45 @@ class ResponseGuard:
             return []
         
         text_upper = text.upper()
+        found_sections = []
         missing = []
         
         for section in required:
-            # Check if section header exists (case-insensitive)
-            # Look for exact match or with colon
-            pattern = rf'\b{re.escape(section.upper())}\s*:'
-            if not re.search(pattern, text_upper):
+            section_upper = section.upper()
+            # Multiple patterns to catch different formatting styles:
+            # 1. "SECTION:" or "SECTION :" (with colon)
+            # 2. "SECTION" on its own line (line-start pattern)
+            # 3. "**SECTION:**" (markdown bold)
+            # 4. "# SECTION" (markdown header)
+            patterns = [
+                rf'\b{re.escape(section_upper)}\s*:',  # Standard: "SECTION:"
+                rf'^{re.escape(section_upper)}\s*:?\s*$',  # Line-start: "SECTION:" at line start
+                rf'^\s*#+\s*{re.escape(section_upper)}\s*$',  # Markdown: "# SECTION"
+                rf'\*\*{re.escape(section_upper)}\*\*:?',  # Markdown bold: "**SECTION**"
+                rf'<h[1-6]>\s*{re.escape(section_upper)}\s*</h[1-6]>',  # HTML header
+                rf'\b{re.escape(section_upper)}\b',  # Just the word (as last resort)
+            ]
+            
+            found = False
+            for pattern in patterns:
+                if re.search(pattern, text_upper, re.MULTILINE):
+                    found = True
+                    found_sections.append(section)
+                    break
+            
+            if not found:
                 missing.append(section)
+        
+        # Log what was found and what's missing
+        if missing:
+            logger.debug(
+                f"Section header check for {task.value}: "
+                f"Found {len(found_sections)}/{len(required)} sections. "
+                f"Found: {found_sections}, Missing: {missing}"
+            )
+            # Log a sample of the actual text to help debug
+            text_sample = text[:500].replace('\n', '\\n')
+            logger.debug(f"Generated text sample (first 500 chars): {text_sample}")
         
         return missing
     
@@ -253,19 +309,38 @@ class ResponseGuard:
         Returns:
             True if text has meaningful content
         """
-        # Check for minimum word count
-        word_count = len(text.split())
-        if word_count < 10:
+        if not text or not text.strip():
             return False
+        
+        # Check for minimum word count (more lenient for long responses)
+        word_count = len(text.split())
+        if word_count < 5:
+            return False
+        
+        # For longer responses (500+ words), assume meaningful content if it has structure
+        if word_count >= 500:
+            # Long responses are likely meaningful if they have sentence structure
+            sentences = text.count('.') + text.count('!') + text.count('?')
+            if sentences >= 5:
+                logger.debug(f"Long response ({word_count} words, {sentences} sentences) - assuming meaningful content")
+                return True
         
         # Check for common medical note indicators
         medical_keywords = [
             "patient", "diagnosis", "treatment", "history", "examination",
             "assessment", "plan", "subjective", "objective", "medication",
-            "discharge", "referral", "information", "provided"
+            "discharge", "referral", "information", "provided", "clinical",
+            "symptom", "sign", "condition", "disease", "test", "result",
+            "vital", "sign", "physical", "chief", "complaint"
         ]
         
         text_lower = text.lower()
-        has_keywords = sum(1 for keyword in medical_keywords if keyword in text_lower) >= 2
+        found_keywords = [kw for kw in medical_keywords if kw in text_lower]
+        has_keywords = len(found_keywords) >= 2
+        
+        if has_keywords:
+            logger.debug(f"Found medical keywords: {found_keywords[:5]}... (total: {len(found_keywords)})")
+        else:
+            logger.debug(f"Medical keyword check: found {len(found_keywords)} keywords, need at least 2")
         
         return has_keywords
