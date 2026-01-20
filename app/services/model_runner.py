@@ -562,11 +562,6 @@ None required."""
                 generation_kwargs["eos_token_id"] = eos_token_id
                 logger.debug(f"Set eos_token_id={eos_token_id} in generation kwargs")
             
-            # CRITICAL FIX: Add input token validation to generation kwargs
-            # This ensures the model doesn't receive out-of-bounds tokens during generation
-            generation_kwargs["input_ids_range_validated"] = True
-            generation_kwargs["embedding_size"] = embedding_size
-            
             # IMPORTANT: Do NOT pass pad_token_id to generation kwargs
             # Let the model use its default padding behavior
             # Explicitly setting pad_token_id can cause generation to produce pad tokens instead of content
