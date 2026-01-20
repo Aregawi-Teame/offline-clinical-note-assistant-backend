@@ -84,6 +84,16 @@ class Settings(BaseSettings):
         description="Log format"
     )
     
+    # CUDA debugging
+    CUDA_LAUNCH_BLOCKING: bool = Field(
+        default=False,
+        description="Enable CUDA launch blocking for debugging (set to '1' to enable)"
+    )
+    TORCH_USE_CUDA_DSA: bool = Field(
+        default=False,
+        description="Enable CUDA device-side assertions (set to '1' to enable)"
+    )
+    
     @property
     def DEBUG(self) -> bool:
         """Debug mode is enabled in dev environment."""

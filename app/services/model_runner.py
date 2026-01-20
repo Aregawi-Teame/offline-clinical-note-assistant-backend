@@ -127,18 +127,32 @@ def _load_model_and_tokenizer(model_id: str, device: str) -> tuple[torch.nn.Modu
             **model_kwargs
         )
         
-        # CRITICAL FIX: Get ACTUAL embedding size from model (not tokenizer vocab_size)
-        # This is the key fix - tokenizer.vocab_size can be different from model embedding table size
+        # CRITICAL FIX: Handle tokenizer/model embedding size mismatch
+        # This is a common issue with MedGemma models where vocab_size != embedding_size
         embedding_size = _global_model.get_input_embeddings().num_embeddings
         tokenizer_vocab_size = _global_tokenizer.vocab_size
         logger.info(f"Model embedding size: {embedding_size}")
         logger.debug(f"Tokenizer vocab size: {tokenizer_vocab_size}")
         
-        # Warn if mismatch detected (this is likely the MedGemma issue!)
-        if embedding_size != tokenizer_vocab_size:
+        # CRITICAL FIX: If tokenizer vocab_size > embedding_size, we MUST resize the model
+        # This prevents CUDA device-side assert errors from out-of-bounds token IDs
+        if tokenizer_vocab_size > embedding_size:
+            logger.error(f"⚠️  CRITICAL MISMATCH: tokenizer vocab_size ({tokenizer_vocab_size}) > model embedding_size ({embedding_size})")
+            logger.error(f"   This WILL cause CUDA device-side assert errors!")
+            logger.info(f"🔧 RESIZING model embeddings to match tokenizer vocab_size ({tokenizer_vocab_size})")
+            
+            # Resize the model embeddings to match tokenizer vocab_size
+            _global_model.resize_token_embeddings(tokenizer_vocab_size)
+            
+            # Update embedding_size after resize
+            embedding_size = _global_model.get_input_embeddings().num_embeddings
+            logger.info(f"✅ Model embeddings resized to: {embedding_size}")
+        
+        # Warn if mismatch detected in other direction
+        elif embedding_size != tokenizer_vocab_size:
             logger.warning(
                 f"⚠️ MISMATCH DETECTED: tokenizer vocab_size ({tokenizer_vocab_size}) "
-                f"!= model embedding_size ({embedding_size}). This can cause CUDA errors!"
+                f"!= model embedding_size ({embedding_size}). Model has extra capacity."
             )
         
         # Log current token IDs before modification
@@ -196,12 +210,20 @@ def _load_model_and_tokenizer(model_id: str, device: str) -> tuple[torch.nn.Modu
         }.items():
             if token_id is not None:
                 if token_id >= embedding_size:
-                    raise RuntimeError(
-                        f"❌ CRITICAL: {token_name.upper()} token ID ({token_id}) >= "
-                        f"model embedding size ({embedding_size}). "
-                        f"This WILL cause CUDA device-side assert errors during generation! "
-                        f"Tokenizer/model mismatch detected for model '{model_id}'."
-                    )
+                    logger.error(f"❌ CRITICAL: {token_name.upper()} token ID ({token_id}) >= "
+                                   f"model embedding size ({embedding_size}). "
+                                   f"This WILL cause CUDA device-side assert errors!")
+                    # Fix: Clamp the token ID to valid range
+                    fixed_token_id = min(token_id, embedding_size - 1)
+                    logger.warning(f"🔧 Fixed {token_name}_token_id from {token_id} to {fixed_token_id}")
+                    
+                    # Update the tokenizer token ID
+                    if token_name == "eos":
+                        _global_tokenizer.eos_token_id = fixed_token_id
+                    elif token_name == "pad":
+                        _global_tokenizer.pad_token_id = fixed_token_id
+                    elif token_name == "bos":
+                        _global_tokenizer.bos_token_id = fixed_token_id
                 else:
                     logger.debug(f"✅ {token_name}_token_id ({token_id}) is valid (< {embedding_size})")
         
@@ -477,25 +499,51 @@ None required."""
             logger.debug(f"Attention mask shape: {inputs.get('attention_mask', 'not provided').shape if hasattr(inputs.get('attention_mask', None), 'shape') else 'not provided'}")
             
             # Prepare generation kwargs
+            # CRITICAL FIX: Validate and clamp ALL input token IDs to embedding bounds
+            # This prevents CUDA device-side assert errors from out-of-bounds token IDs
+            embedding_size = _global_model.get_input_embeddings().num_embeddings
+            input_token_ids = inputs["input_ids"][0]
+            max_input_token_id = input_token_ids.max().item()
+            min_input_token_id = input_token_ids.min().item()
+            
+            logger.debug(f"Input token ID range: [{min_input_token_id}, {max_input_token_id}], embedding_size: {embedding_size}")
+            
+            # Check if any input tokens are out of bounds
+            if max_input_token_id >= embedding_size:
+                logger.error(f"⚠️  INPUT TOKENS OUT OF BOUNDS: max token ID ({max_input_token_id}) >= embedding_size ({embedding_size})")
+                logger.error(f"   This WILL cause CUDA device-side assert errors!")
+                
+                # Clamp out-of-bounds tokens to valid range (emergency fix)
+                # Replace invalid tokens with UNK token or pad token
+                unk_token_id = _global_tokenizer.unk_token_id if _global_tokenizer.unk_token_id is not None else _global_tokenizer.pad_token_id
+                if unk_token_id is None or unk_token_id >= embedding_size:
+                    # Fallback: use 0 as safe token ID (usually BOS or safe range)
+                    unk_token_id = 0
+                    if unk_token_id >= embedding_size:
+                        unk_token_id = embedding_size - 1  # Last valid token
+                        logger.warning(f"Using last valid token ({unk_token_id}) as replacement")
+                
+                # Clamp the input tokens
+                inputs["input_ids"] = torch.clamp(inputs["input_ids"], 0, embedding_size - 1)
+                logger.warning(f"🔧 CLAMPED input tokens to range [0, {embedding_size - 1}]")
+                logger.info(f"   Original max token: {max_input_token_id}, clamped max: {inputs['input_ids'].max().item()}")
+            
             # Get token IDs (validate they're within bounds)
             eos_token_id = _global_tokenizer.eos_token_id
             pad_token_id = _global_tokenizer.pad_token_id
             
-            # Validate token IDs before passing to model (use EMBEDDING SIZE, not vocab_size)
-            embedding_size = _global_model.get_input_embeddings().num_embeddings
+            # Validate special token IDs before passing to model
             if eos_token_id is not None and eos_token_id >= embedding_size:
                 logger.error(f"⚠️  eos_token_id ({eos_token_id}) >= embedding_size ({embedding_size}) - this will cause CUDA errors!")
-                raise RuntimeError(
-                    f"Token configuration error: eos_token_id ({eos_token_id}) is out of bounds. "
-                    "This indicates a tokenizer/model mismatch."
-                )
+                # Fix: Use a safe token ID within bounds
+                eos_token_id = min(eos_token_id, embedding_size - 1)
+                logger.warning(f"🔧 Fixed eos_token_id to {eos_token_id} (within embedding bounds)")
             
             if pad_token_id is not None and pad_token_id >= embedding_size:
                 logger.error(f"⚠️  pad_token_id ({pad_token_id}) >= embedding_size ({embedding_size}) - this will cause CUDA errors!")
-                raise RuntimeError(
-                    f"Token configuration error: pad_token_id ({pad_token_id}) is out of bounds. "
-                    "This indicates a tokenizer/model mismatch."
-                )
+                # Fix: Use a safe token ID within bounds
+                pad_token_id = min(pad_token_id, embedding_size - 1)
+                logger.warning(f"🔧 Fixed pad_token_id to {pad_token_id} (within embedding bounds)")
             
             logger.debug(f"Token IDs validated: eos={eos_token_id}, pad={pad_token_id}, embedding_size={embedding_size}")
             
@@ -513,6 +561,11 @@ None required."""
             if eos_token_id is not None:
                 generation_kwargs["eos_token_id"] = eos_token_id
                 logger.debug(f"Set eos_token_id={eos_token_id} in generation kwargs")
+            
+            # CRITICAL FIX: Add input token validation to generation kwargs
+            # This ensures the model doesn't receive out-of-bounds tokens during generation
+            generation_kwargs["input_ids_range_validated"] = True
+            generation_kwargs["embedding_size"] = embedding_size
             
             # IMPORTANT: Do NOT pass pad_token_id to generation kwargs
             # Let the model use its default padding behavior

@@ -1,6 +1,7 @@
 """
 Main FastAPI application entry point.
 """
+import os
 import uuid
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,9 +12,18 @@ from app.core.logging import setup_logging, get_logger
 from app.api.v1.routes import api_router
 from app.utils.timing import Timer
 
-# Setup logging
+# Setup logging first
 setup_logging()
 logger = get_logger(__name__)
+
+# Setup CUDA debugging environment variables if enabled
+if settings.CUDA_LAUNCH_BLOCKING:
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    logger.info("🔧 CUDA_LAUNCH_BLOCKING enabled for debugging")
+
+if settings.TORCH_USE_CUDA_DSA:
+    os.environ["TORCH_USE_CUDA_DSA"] = "1"
+    logger.info("🔧 TORCH_USE_CUDA_DSA enabled for device-side assertions")
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
