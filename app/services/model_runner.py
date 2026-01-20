@@ -120,6 +120,15 @@ def _load_model_and_tokenizer(model_id: str, device: str) -> tuple[torch.nn.Modu
         else:
             _global_tokenizer = AutoTokenizer.from_pretrained(model_id)
         
+        # Ensure pad_token is set if tokenizer doesn't have one (use eos_token as fallback)
+        # This is important for proper tokenization, but we won't use pad_token in generation
+        if _global_tokenizer.pad_token is None:
+            if _global_tokenizer.eos_token is not None:
+                _global_tokenizer.pad_token = _global_tokenizer.eos_token
+                logger.debug(f"Set pad_token to eos_token: {_global_tokenizer.eos_token}")
+            else:
+                logger.warning("Tokenizer has no pad_token or eos_token - this may cause issues")
+        
         # Load model
         logger.debug("Loading model (this may take a while)...")
         _global_model = AutoModelForCausalLM.from_pretrained(
@@ -396,22 +405,29 @@ None required."""
             # Temperature 0.2 is default, so we use greedy by default (more stable)
             use_sampling = temperature > 0.2
             
-            # Get token IDs - use eos_token_id for padding if pad_token_id is None
+            # Get token IDs
             eos_token_id = _global_tokenizer.eos_token_id
             pad_token_id = _global_tokenizer.pad_token_id
             
-            # Prefer eos_token_id for padding to avoid generating pad tokens
-            # Only use pad_token_id if eos_token_id is None
-            effective_pad_token = pad_token_id if pad_token_id is not None else eos_token_id
+            # IMPORTANT: Do NOT pass pad_token_id to generation kwargs
+            # pad_token_id is only used for input padding, not for generation
+            # If passed, the model may generate pad tokens instead of stopping at EOS
+            # Only set eos_token_id to ensure proper stopping
             
             generation_kwargs = {
                 "max_new_tokens": max_new_tokens,
-                "pad_token_id": effective_pad_token,
                 "eos_token_id": eos_token_id,  # Explicitly set EOS token to stop generation properly
                 "repetition_penalty": 1.1,  # Slight penalty to reduce repetition loops
             }
             
-            logger.debug(f"Generation token IDs: pad_token_id={pad_token_id}, eos_token_id={eos_token_id}, effective_pad_token={effective_pad_token}")
+            # Only add pad_token_id if model doesn't have one set and we need it for input padding
+            # But do NOT use it as a generation stopping criterion
+            if pad_token_id is not None and eos_token_id is None:
+                # Rare case: model has pad but no EOS - use pad for stopping (not ideal)
+                logger.warning(f"Model has pad_token_id ({pad_token_id}) but no eos_token_id - using pad for stopping")
+                generation_kwargs["eos_token_id"] = pad_token_id
+            
+            logger.debug(f"Generation token IDs: pad_token_id={pad_token_id} (NOT used in generation), eos_token_id={eos_token_id}")
             
             if use_sampling:
                 # Ensure temperature is within safe range for sampling
@@ -506,16 +522,29 @@ None required."""
                 token_list = generated_tokens.tolist()
                 filtered_tokens = [tok_id for tok_id in token_list if tok_id not in special_token_ids]
                 
-                if len(filtered_tokens) == 0:
+                # Check if ALL tokens are pad tokens (critical issue)
+                unique_tokens = set(token_list)
+                if len(unique_tokens) == 1 and pad_token_id in unique_tokens:
+                    logger.error(f"⚠️  CRITICAL: All {num_new_tokens} generated tokens are pad_token_id ({pad_token_id})!")
+                    logger.error(f"   This indicates the model generated no content - only padding.")
+                    logger.error(f"   Possible causes:")
+                    logger.error(f"     1. Model is not generating properly (check model config)")
+                    logger.error(f"     2. Prompt may be too long or malformed")
+                    logger.error(f"     3. Generation kwargs may be incorrect")
+                    logger.error(f"     4. Model may need different eos_token_id or stopping criteria")
+                    # Don't decode - will trigger empty text handling below
+                    generated_text = ""
+                elif len(filtered_tokens) == 0:
                     logger.error(f"⚠️  All {num_new_tokens} generated tokens are special tokens (pad/eos/bos/unk). Model generated no meaningful content!")
-                    # Check what tokens were generated
-                    unique_tokens = set(token_list)
                     logger.error(f"   Unique token IDs generated: {unique_tokens}")
                     if pad_token_id and pad_token_id in unique_tokens:
-                        logger.error(f"   Model generated pad_token_id ({pad_token_id}) repeatedly - this should not happen!")
-                        logger.error(f"   Possible causes: model config issue, or generation hit max_new_tokens with padding")
+                        pad_count = token_list.count(pad_token_id)
+                        logger.error(f"   Model generated pad_token_id ({pad_token_id}) {pad_count}/{num_new_tokens} times - this should not happen!")
+                        logger.error(f"   Possible causes: pad_token_id was passed to generation kwargs (should only use eos_token_id)")
+                        logger.error(f"   Or model has generation config issues")
                     if eos_token_id and eos_token_id in unique_tokens:
-                        logger.warning(f"   Model generated eos_token_id ({eos_token_id}) - generation may have ended immediately")
+                        eos_count = token_list.count(eos_token_id)
+                        logger.warning(f"   Model generated eos_token_id ({eos_token_id}) {eos_count} times - generation may have ended immediately")
                     # Don't decode - will trigger empty text handling below
                     generated_text = ""
                 else:
