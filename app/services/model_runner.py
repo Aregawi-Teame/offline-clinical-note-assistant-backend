@@ -2,6 +2,7 @@
 Service for running the language model with Hugging Face Transformers.
 """
 from typing import Optional
+import time
 import torch
 
 from app.core.config import settings
