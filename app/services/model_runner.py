@@ -120,16 +120,38 @@ def _load_model_and_tokenizer(model_id: str, device: str) -> tuple[torch.nn.Modu
         else:
             _global_tokenizer = AutoTokenizer.from_pretrained(model_id)
         
-        # CRITICAL FIX: Ensure pad_token_id matches eos_token_id to avoid pad token generation
-        # If pad_token_id is None or different from eos_token_id, this can cause the model
-        # to generate pad tokens (like 0) instead of stopping at EOS
-        if _global_tokenizer.pad_token_id is None or _global_tokenizer.pad_token_id != _global_tokenizer.eos_token_id:
+        # Get vocabulary size for validation
+        vocab_size = _global_tokenizer.vocab_size
+        logger.debug(f"Tokenizer vocabulary size: {vocab_size}")
+        
+        # Log current token IDs before modification
+        logger.debug(f"Original token IDs - pad: {_global_tokenizer.pad_token_id}, eos: {_global_tokenizer.eos_token_id}, bos: {_global_tokenizer.bos_token_id}")
+        
+        # CRITICAL FIX: Set pad_token_id if None, but don't force it to match eos_token_id
+        # Forcing them to match can cause CUDA errors if the token IDs are out of bounds
+        if _global_tokenizer.pad_token_id is None:
             if _global_tokenizer.eos_token_id is not None:
-                _global_tokenizer.pad_token_id = _global_tokenizer.eos_token_id
-                _global_tokenizer.pad_token = _global_tokenizer.eos_token
-                logger.info(f"Set pad_token_id to match eos_token_id ({_global_tokenizer.eos_token_id}) to prevent pad token generation")
+                # Validate eos_token_id is within vocab bounds
+                if _global_tokenizer.eos_token_id < vocab_size:
+                    _global_tokenizer.pad_token_id = _global_tokenizer.eos_token_id
+                    _global_tokenizer.pad_token = _global_tokenizer.eos_token
+                    logger.info(f"Set pad_token_id to eos_token_id ({_global_tokenizer.eos_token_id}) - within vocab bounds")
+                else:
+                    logger.error(f"eos_token_id ({_global_tokenizer.eos_token_id}) is out of vocab bounds ({vocab_size})!")
+                    # Fall back to using the last valid token ID
+                    _global_tokenizer.pad_token_id = vocab_size - 1
+                    logger.warning(f"Using fallback pad_token_id: {_global_tokenizer.pad_token_id}")
             else:
-                logger.warning("Tokenizer has no pad_token or eos_token - this may cause issues")
+                logger.warning("Tokenizer has no eos_token_id - using vocab_size - 1 as pad_token_id")
+                _global_tokenizer.pad_token_id = vocab_size - 1
+        else:
+            # Validate existing pad_token_id is within bounds
+            if _global_tokenizer.pad_token_id >= vocab_size:
+                logger.error(f"pad_token_id ({_global_tokenizer.pad_token_id}) is out of vocab bounds ({vocab_size})!")
+                _global_tokenizer.pad_token_id = vocab_size - 1
+                logger.warning(f"Reset pad_token_id to: {_global_tokenizer.pad_token_id}")
+            else:
+                logger.debug(f"Existing pad_token_id ({_global_tokenizer.pad_token_id}) is valid")
         
         # CRITICAL FIX: Set padding side to "left" for CausalLM models
         # This ensures attention_mask works correctly and prevents the model from failing to "see" the prompt
@@ -143,11 +165,30 @@ def _load_model_and_tokenizer(model_id: str, device: str) -> tuple[torch.nn.Modu
             **model_kwargs
         )
         
-        # CRITICAL FIX: Ensure model config pad_token_id matches tokenizer
+        # CRITICAL FIX: Sync model config with tokenizer, but validate first
         # This prevents the model from generating pad tokens during generation
         if hasattr(_global_model, 'config') and _global_tokenizer.pad_token_id is not None:
-            _global_model.config.pad_token_id = _global_tokenizer.pad_token_id
-            logger.debug(f"Set model.config.pad_token_id to {_global_tokenizer.pad_token_id} to match tokenizer")
+            # Validate pad_token_id against model vocab size
+            model_vocab_size = _global_model.config.vocab_size if hasattr(_global_model.config, 'vocab_size') else vocab_size
+            
+            if _global_tokenizer.pad_token_id < model_vocab_size:
+                _global_model.config.pad_token_id = _global_tokenizer.pad_token_id
+                logger.debug(f"Set model.config.pad_token_id to {_global_tokenizer.pad_token_id} (validated against vocab_size={model_vocab_size})")
+            else:
+                logger.error(f"Cannot set model pad_token_id: {_global_tokenizer.pad_token_id} >= model vocab_size ({model_vocab_size})")
+                logger.warning("Model config pad_token_id will remain unchanged to prevent CUDA errors")
+        
+        # Validate eos_token_id as well (critical for generation)
+        if hasattr(_global_tokenizer, 'eos_token_id') and _global_tokenizer.eos_token_id is not None:
+            if _global_tokenizer.eos_token_id >= vocab_size:
+                logger.error(f"⚠️  CRITICAL: eos_token_id ({_global_tokenizer.eos_token_id}) >= vocab_size ({vocab_size})")
+                logger.error("   This WILL cause CUDA device-side assert errors during generation!")
+                raise ValueError(
+                    f"Tokenizer eos_token_id ({_global_tokenizer.eos_token_id}) is out of vocabulary bounds ({vocab_size}). "
+                    "This indicates a tokenizer/model mismatch. Please verify MODEL_ID is correct."
+                )
+            else:
+                logger.debug(f"Validated eos_token_id ({_global_tokenizer.eos_token_id}) is within vocab bounds")
         
         # Only move to device manually if NOT using device_map (i.e., for CPU)
         # Using device_map="auto" and .to(device) together causes RuntimeError
@@ -413,18 +454,27 @@ None required."""
             logger.debug(f"Attention mask shape: {inputs.get('attention_mask', 'not provided').shape if hasattr(inputs.get('attention_mask', None), 'shape') else 'not provided'}")
             
             # Prepare generation kwargs
-            # Get token IDs (should be same after our fix in _load_model_and_tokenizer)
+            # Get token IDs (validate they're within bounds)
             eos_token_id = _global_tokenizer.eos_token_id
             pad_token_id = _global_tokenizer.pad_token_id
             
-            # CRITICAL FIX: Ensure pad_token_id equals eos_token_id to prevent collapse
-            if pad_token_id != eos_token_id and eos_token_id is not None:
-                logger.warning(
-                    f"pad_token_id ({pad_token_id}) != eos_token_id ({eos_token_id}). "
-                    "This can cause pad token generation. Setting pad_token_id to eos_token_id."
+            # Validate token IDs before passing to model
+            vocab_size = _global_tokenizer.vocab_size
+            if eos_token_id is not None and eos_token_id >= vocab_size:
+                logger.error(f"⚠️  eos_token_id ({eos_token_id}) >= vocab_size ({vocab_size}) - this will cause CUDA errors!")
+                raise RuntimeError(
+                    f"Token configuration error: eos_token_id ({eos_token_id}) is out of bounds. "
+                    "This indicates a tokenizer/model mismatch."
                 )
-                _global_tokenizer.pad_token_id = eos_token_id
-                pad_token_id = eos_token_id
+            
+            if pad_token_id is not None and pad_token_id >= vocab_size:
+                logger.error(f"⚠️  pad_token_id ({pad_token_id}) >= vocab_size ({vocab_size}) - this will cause CUDA errors!")
+                raise RuntimeError(
+                    f"Token configuration error: pad_token_id ({pad_token_id}) is out of bounds. "
+                    "This indicates a tokenizer/model mismatch."
+                )
+            
+            logger.debug(f"Token IDs validated: eos={eos_token_id}, pad={pad_token_id}, vocab_size={vocab_size}")
             
             # Determine if we should use sampling
             # CRITICAL FIX: If top_p is provided (> 0), use sampling to avoid getting stuck in loops
@@ -433,9 +483,17 @@ None required."""
             
             generation_kwargs = {
                 "max_new_tokens": max_new_tokens,
-                "eos_token_id": eos_token_id,  # Explicitly set EOS token to stop generation properly
                 "repetition_penalty": 1.1,  # Slight penalty to reduce repetition loops
             }
+            
+            # Only add eos_token_id if it's valid (not None and within bounds)
+            if eos_token_id is not None:
+                generation_kwargs["eos_token_id"] = eos_token_id
+                logger.debug(f"Set eos_token_id={eos_token_id} in generation kwargs")
+            
+            # IMPORTANT: Do NOT pass pad_token_id to generation kwargs
+            # Let the model use its default padding behavior
+            # Explicitly setting pad_token_id can cause generation to produce pad tokens instead of content
             
             if use_sampling:
                 # Ensure temperature is within safe range for sampling
@@ -456,8 +514,7 @@ None required."""
                     f"repetition_penalty={generation_kwargs['repetition_penalty']}"
                 )
             
-            logger.debug(f"Generation token IDs: pad_token_id={pad_token_id}, eos_token_id={eos_token_id} (should match)")
-            
+            logger.debug(f"Generation kwargs prepared: {generation_kwargs}")
             logger.info(f"Step 2: Starting model.generate() on device {self.device} with kwargs: {generation_kwargs}")
             logger.debug(f"Model device: {next(_global_model.parameters()).device}")
             logger.info(f"Input tensor device: {inputs['input_ids'].device}")
