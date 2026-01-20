@@ -120,14 +120,21 @@ def _load_model_and_tokenizer(model_id: str, device: str) -> tuple[torch.nn.Modu
         else:
             _global_tokenizer = AutoTokenizer.from_pretrained(model_id)
         
-        # Ensure pad_token is set if tokenizer doesn't have one (use eos_token as fallback)
-        # This is important for proper tokenization, but we won't use pad_token in generation
-        if _global_tokenizer.pad_token is None:
-            if _global_tokenizer.eos_token is not None:
+        # CRITICAL FIX: Ensure pad_token_id matches eos_token_id to avoid pad token generation
+        # If pad_token_id is None or different from eos_token_id, this can cause the model
+        # to generate pad tokens (like 0) instead of stopping at EOS
+        if _global_tokenizer.pad_token_id is None or _global_tokenizer.pad_token_id != _global_tokenizer.eos_token_id:
+            if _global_tokenizer.eos_token_id is not None:
+                _global_tokenizer.pad_token_id = _global_tokenizer.eos_token_id
                 _global_tokenizer.pad_token = _global_tokenizer.eos_token
-                logger.debug(f"Set pad_token to eos_token: {_global_tokenizer.eos_token}")
+                logger.info(f"Set pad_token_id to match eos_token_id ({_global_tokenizer.eos_token_id}) to prevent pad token generation")
             else:
                 logger.warning("Tokenizer has no pad_token or eos_token - this may cause issues")
+        
+        # CRITICAL FIX: Set padding side to "left" for CausalLM models
+        # This ensures attention_mask works correctly and prevents the model from failing to "see" the prompt
+        _global_tokenizer.padding_side = "left"
+        logger.debug(f"Set padding_side to 'left' for CausalLM compatibility")
         
         # Load model
         logger.debug("Loading model (this may take a while)...")
@@ -135,6 +142,12 @@ def _load_model_and_tokenizer(model_id: str, device: str) -> tuple[torch.nn.Modu
             model_id,
             **model_kwargs
         )
+        
+        # CRITICAL FIX: Ensure model config pad_token_id matches tokenizer
+        # This prevents the model from generating pad tokens during generation
+        if hasattr(_global_model, 'config') and _global_tokenizer.pad_token_id is not None:
+            _global_model.config.pad_token_id = _global_tokenizer.pad_token_id
+            logger.debug(f"Set model.config.pad_token_id to {_global_tokenizer.pad_token_id} to match tokenizer")
         
         # Only move to device manually if NOT using device_map (i.e., for CPU)
         # Using device_map="auto" and .to(device) together causes RuntimeError
@@ -400,19 +413,23 @@ None required."""
             logger.debug(f"Attention mask shape: {inputs.get('attention_mask', 'not provided').shape if hasattr(inputs.get('attention_mask', None), 'shape') else 'not provided'}")
             
             # Prepare generation kwargs
-            # For low temperatures (<= 0.2), use greedy decoding to avoid numerical issues
-            # This is especially important for MPS and some GPU setups
-            # Temperature 0.2 is default, so we use greedy by default (more stable)
-            use_sampling = temperature > 0.2
-            
-            # Get token IDs
+            # Get token IDs (should be same after our fix in _load_model_and_tokenizer)
             eos_token_id = _global_tokenizer.eos_token_id
             pad_token_id = _global_tokenizer.pad_token_id
             
-            # IMPORTANT: Do NOT pass pad_token_id to generation kwargs
-            # pad_token_id is only used for input padding, not for generation
-            # If passed, the model may generate pad tokens instead of stopping at EOS
-            # Only set eos_token_id to ensure proper stopping
+            # CRITICAL FIX: Ensure pad_token_id equals eos_token_id to prevent collapse
+            if pad_token_id != eos_token_id and eos_token_id is not None:
+                logger.warning(
+                    f"pad_token_id ({pad_token_id}) != eos_token_id ({eos_token_id}). "
+                    "This can cause pad token generation. Setting pad_token_id to eos_token_id."
+                )
+                _global_tokenizer.pad_token_id = eos_token_id
+                pad_token_id = eos_token_id
+            
+            # Determine if we should use sampling
+            # CRITICAL FIX: If top_p is provided (> 0), use sampling to avoid getting stuck in loops
+            # Greedy decoding can get stuck in repetitive pad token loops
+            use_sampling = temperature > 0.2 or top_p > 0
             
             generation_kwargs = {
                 "max_new_tokens": max_new_tokens,
@@ -420,28 +437,26 @@ None required."""
                 "repetition_penalty": 1.1,  # Slight penalty to reduce repetition loops
             }
             
-            # Only add pad_token_id if model doesn't have one set and we need it for input padding
-            # But do NOT use it as a generation stopping criterion
-            if pad_token_id is not None and eos_token_id is None:
-                # Rare case: model has pad but no EOS - use pad for stopping (not ideal)
-                logger.warning(f"Model has pad_token_id ({pad_token_id}) but no eos_token_id - using pad for stopping")
-                generation_kwargs["eos_token_id"] = pad_token_id
-            
-            logger.debug(f"Generation token IDs: pad_token_id={pad_token_id} (NOT used in generation), eos_token_id={eos_token_id}")
-            
             if use_sampling:
                 # Ensure temperature is within safe range for sampling
                 safe_temperature = max(0.3, min(temperature, 2.0))
                 generation_kwargs["temperature"] = safe_temperature
                 generation_kwargs["top_p"] = max(0.1, min(top_p, 1.0))
                 generation_kwargs["do_sample"] = True
-                logger.debug(f"Using sampling mode: temperature={safe_temperature}, top_p={generation_kwargs['top_p']}, repetition_penalty={generation_kwargs['repetition_penalty']}")
+                logger.debug(
+                    f"Using sampling mode: temperature={safe_temperature}, top_p={generation_kwargs['top_p']}, "
+                    f"repetition_penalty={generation_kwargs['repetition_penalty']}"
+                )
             else:
-                # Greedy decoding for low/zero temperature (more stable, deterministic)
-                # Don't pass temperature or top_p when using greedy decoding
-                # But we still apply repetition_penalty to avoid loops
+                # Greedy decoding for low/zero temperature
+                # Note: Greedy decoding can get stuck in loops, but is more deterministic
                 generation_kwargs["do_sample"] = False
-                logger.debug(f"Using greedy decoding mode (temperature <= 0.2), repetition_penalty={generation_kwargs['repetition_penalty']}")
+                logger.debug(
+                    f"Using greedy decoding mode (temperature={temperature}, no top_p), "
+                    f"repetition_penalty={generation_kwargs['repetition_penalty']}"
+                )
+            
+            logger.debug(f"Generation token IDs: pad_token_id={pad_token_id}, eos_token_id={eos_token_id} (should match)")
             
             logger.info(f"Step 2: Starting model.generate() on device {self.device} with kwargs: {generation_kwargs}")
             logger.debug(f"Model device: {next(_global_model.parameters()).device}")
@@ -457,8 +472,11 @@ None required."""
             with torch.no_grad():
                 logger.info(f"Step 3: Calling model.generate() on {self.device} - this may take a while...")
                 try:
+                    # CRITICAL FIX: Explicitly pass attention_mask to ensure model "sees" the prompt correctly
+                    # This prevents the model from failing to see the prompt and defaulting to pad tokens
                     outputs = _global_model.generate(
-                        **inputs,
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs.get("attention_mask"),  # Explicitly pass attention mask
                         **generation_kwargs
                     )
                     generation_time = time.time() - generation_start
