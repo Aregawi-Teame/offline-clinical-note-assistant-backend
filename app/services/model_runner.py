@@ -481,12 +481,36 @@ None required."""
         )
         
         try:
-            # Tokenize input
+            # CRITICAL FIX: Comprehensive input validation BEFORE tokenization
+            # This prevents CUDA device-side assert errors from malformed input
+            logger.debug(f"Step 0: Pre-tokenization validation - prompt length: {len(prompt)} chars")
+            
+            # Check for potential issues in prompt that could cause tokenization problems
+            if len(prompt.strip()) == 0:
+                raise ValueError("Empty prompt provided")
+            
+            if len(prompt) > 50000:  # Reasonable limit to prevent OOM
+                logger.warning(f"Very long prompt ({len(prompt)} chars) may cause issues")
+            
+            # Tokenize input with enhanced validation
             logger.debug("Step 1: Tokenizing input prompt...")
-            # Tokenize and move to device
-            # Note: attention_mask is automatically included in inputs dict
-            inputs = _global_tokenizer(prompt, return_tensors="pt").to(self.device)
-            input_length = inputs["input_ids"].shape[1]
+            try:
+                # Tokenize and move to device
+                # Note: attention_mask is automatically included in inputs dict
+                inputs = _global_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                input_length = inputs["input_ids"].shape[1]
+                
+                # CRITICAL: Validate tokenization results
+                if input_length == 0:
+                    raise ValueError("Tokenization produced empty input")
+                
+                if input_length > 2048:  # Conservative limit for MedGemma
+                    logger.warning(f"Long input sequence ({input_length} tokens) may cause CUDA issues")
+                
+            except Exception as tokenize_error:
+                logger.error(f"Tokenization failed: {tokenize_error}")
+                raise RuntimeError(f"Failed to tokenize prompt: {tokenize_error}") from tokenize_error
             
             # Log tokenization details for debugging BOS/EOS token issues
             # Check if BOS token was added (some tokenizers add it, some don't)
@@ -499,7 +523,7 @@ None required."""
             logger.debug(f"Attention mask shape: {inputs.get('attention_mask', 'not provided').shape if hasattr(inputs.get('attention_mask', None), 'shape') else 'not provided'}")
             
             # Prepare generation kwargs
-            # CRITICAL FIX: Validate and clamp ALL input token IDs to embedding bounds
+            # CRITICAL FIX: Enhanced token validation with comprehensive bounds checking
             # This prevents CUDA device-side assert errors from out-of-bounds token IDs
             embedding_size = _global_model.get_input_embeddings().num_embeddings
             input_token_ids = inputs["input_ids"][0]
@@ -508,13 +532,13 @@ None required."""
             
             logger.debug(f"Input token ID range: [{min_input_token_id}, {max_input_token_id}], embedding_size: {embedding_size}")
             
-            # Check if any input tokens are out of bounds
+            # CRITICAL: Check if any input tokens are out of bounds
             if max_input_token_id >= embedding_size:
                 logger.error(f"⚠️  INPUT TOKENS OUT OF BOUNDS: max token ID ({max_input_token_id}) >= embedding_size ({embedding_size})")
                 logger.error(f"   This WILL cause CUDA device-side assert errors!")
                 
-                # Clamp out-of-bounds tokens to valid range (emergency fix)
-                # Replace invalid tokens with UNK token or pad token
+                # EMERGENCY FIX: Clamp out-of-bounds tokens to valid range
+                # This is a last resort to prevent CUDA crashes
                 unk_token_id = _global_tokenizer.unk_token_id if _global_tokenizer.unk_token_id is not None else _global_tokenizer.pad_token_id
                 if unk_token_id is None or unk_token_id >= embedding_size:
                     # Fallback: use 0 as safe token ID (usually BOS or safe range)
@@ -527,23 +551,49 @@ None required."""
                 inputs["input_ids"] = torch.clamp(inputs["input_ids"], 0, embedding_size - 1)
                 logger.warning(f"🔧 CLAMPED input tokens to range [0, {embedding_size - 1}]")
                 logger.info(f"   Original max token: {max_input_token_id}, clamped max: {inputs['input_ids'].max().item()}")
+                
+                # Also update attention mask if it exists
+                if "attention_mask" in inputs:
+                    # Ensure attention mask matches clamped input_ids
+                    inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
+                    logger.debug("Updated attention mask to match clamped input_ids")
             
             # Get token IDs (validate they're within bounds)
             eos_token_id = _global_tokenizer.eos_token_id
             pad_token_id = _global_tokenizer.pad_token_id
+            bos_token_id = _global_tokenizer.bos_token_id
+            unk_token_id = _global_tokenizer.unk_token_id
             
-            # Validate special token IDs before passing to model
-            if eos_token_id is not None and eos_token_id >= embedding_size:
-                logger.error(f"⚠️  eos_token_id ({eos_token_id}) >= embedding_size ({embedding_size}) - this will cause CUDA errors!")
-                # Fix: Use a safe token ID within bounds
-                eos_token_id = min(eos_token_id, embedding_size - 1)
-                logger.warning(f"🔧 Fixed eos_token_id to {eos_token_id} (within embedding bounds)")
+            # CRITICAL: Validate ALL special token IDs before passing to model
+            special_tokens = {
+                "eos": eos_token_id,
+                "pad": pad_token_id, 
+                "bos": bos_token_id,
+                "unk": unk_token_id
+            }
             
-            if pad_token_id is not None and pad_token_id >= embedding_size:
-                logger.error(f"⚠️  pad_token_id ({pad_token_id}) >= embedding_size ({embedding_size}) - this will cause CUDA errors!")
-                # Fix: Use a safe token ID within bounds
-                pad_token_id = min(pad_token_id, embedding_size - 1)
-                logger.warning(f"🔧 Fixed pad_token_id to {pad_token_id} (within embedding bounds)")
+            for token_name, token_id in special_tokens.items():
+                if token_id is not None and token_id >= embedding_size:
+                    logger.error(f"⚠️  {token_name.upper()}_token_id ({token_id}) >= embedding_size ({embedding_size}) - this will cause CUDA errors!")
+                    # Fix: Clamp the token ID to valid range
+                    fixed_token_id = min(token_id, embedding_size - 1)
+                    logger.warning(f"🔧 Fixed {token_name}_token_id from {token_id} to {fixed_token_id}")
+                    
+                    # Update the tokenizer token ID
+                    if token_name == "eos":
+                        _global_tokenizer.eos_token_id = fixed_token_id
+                        eos_token_id = fixed_token_id
+                    elif token_name == "pad":
+                        _global_tokenizer.pad_token_id = fixed_token_id
+                        pad_token_id = fixed_token_id
+                    elif token_name == "bos":
+                        _global_tokenizer.bos_token_id = fixed_token_id
+                        bos_token_id = fixed_token_id
+                    elif token_name == "unk":
+                        _global_tokenizer.unk_token_id = fixed_token_id
+                        unk_token_id = fixed_token_id
+                else:
+                    logger.debug(f"✅ {token_name}_token_id ({token_id}) is valid (< {embedding_size})")
             
             logger.debug(f"Token IDs validated: eos={eos_token_id}, pad={pad_token_id}, embedding_size={embedding_size}")
             
@@ -594,8 +644,8 @@ None required."""
             # Device should already be resolved (MPS -> CPU) in _resolve_device
             # No need for fallback logic - device resolution handles MPS -> CPU conversion
             
-            # Generate with torch.no_grad() for efficiency
-            import time
+            # CRITICAL FIX: Add CPU fallback for persistent CUDA errors
+            # This ensures the service remains available even if CUDA has issues
             generation_start = time.time()
             with torch.no_grad():
                 logger.info(f"Step 3: Calling model.generate() on {self.device} - this may take a while...")
@@ -609,6 +659,52 @@ None required."""
                     )
                     generation_time = time.time() - generation_start
                     logger.info(f"Generation complete in {generation_time:.1f}s. Output shape: {outputs.shape}")
+                except RuntimeError as cuda_error:
+                    generation_time = time.time() - generation_start
+                    error_msg = str(cuda_error).lower()
+                    
+                    # Check if it's a CUDA device-side assert error
+                    if "device-side assert" in error_msg or "cuda error" in error_msg:
+                        logger.error(f"CUDA device-side assert detected after {generation_time:.1f}s: {cuda_error}")
+                        
+                        # If we're on CUDA and this is a device-side assert, try CPU fallback
+                        if self.device != "cpu":
+                            logger.warning("🔄 Attempting CPU fallback due to CUDA device-side assert...")
+                            try:
+                                # Move inputs to CPU
+                                cpu_inputs = {k: v.cpu() for k, v in inputs.items()}
+                                
+                                # Try generation on CPU
+                                outputs = _global_model.cpu().generate(
+                                    input_ids=cpu_inputs["input_ids"],
+                                    attention_mask=cpu_inputs.get("attention_mask"),
+                                    **generation_kwargs
+                                )
+                                
+                                # Move outputs back to original device for consistency
+                                outputs = outputs.to(self.device)
+                                generation_time = time.time() - generation_start
+                                logger.info(f"✅ CPU fallback successful! Generation completed in {generation_time:.1f}s")
+                                logger.warning("⚠️  Consider using DEVICE=cpu permanently if CUDA errors persist")
+                                
+                            except Exception as cpu_fallback_error:
+                                logger.error(f"❌ CPU fallback also failed: {cpu_fallback_error}")
+                                raise RuntimeError(
+                                    f"CUDA device-side assert error and CPU fallback both failed. "
+                                    f"CUDA error: {cuda_error}. CPU error: {cpu_fallback_error}. "
+                                    f"Try using DEVICE=cpu or reducing prompt length."
+                                ) from cuda_error
+                        else:
+                            # We're already on CPU and still getting errors
+                            raise RuntimeError(
+                                f"CUDA device-side assert error on CPU: {cuda_error}. "
+                                f"This suggests a model/tokenizer compatibility issue. "
+                                f"Try using a different model or checking prompt content."
+                            ) from cuda_error
+                    else:
+                        # Different type of RuntimeError
+                        raise cuda_error
+                        
                 except Exception as gen_error:
                     generation_time = time.time() - generation_start
                     logger.error(f"Generation failed after {generation_time:.1f}s: {gen_error}")
