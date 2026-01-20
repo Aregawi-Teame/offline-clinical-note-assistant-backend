@@ -120,75 +120,97 @@ def _load_model_and_tokenizer(model_id: str, device: str) -> tuple[torch.nn.Modu
         else:
             _global_tokenizer = AutoTokenizer.from_pretrained(model_id)
         
-        # Get vocabulary size for validation
-        vocab_size = _global_tokenizer.vocab_size
-        logger.debug(f"Tokenizer vocabulary size: {vocab_size}")
-        
-        # Log current token IDs before modification
-        logger.debug(f"Original token IDs - pad: {_global_tokenizer.pad_token_id}, eos: {_global_tokenizer.eos_token_id}, bos: {_global_tokenizer.bos_token_id}")
-        
-        # CRITICAL FIX: Set pad_token_id if None, but don't force it to match eos_token_id
-        # Forcing them to match can cause CUDA errors if the token IDs are out of bounds
-        if _global_tokenizer.pad_token_id is None:
-            if _global_tokenizer.eos_token_id is not None:
-                # Validate eos_token_id is within vocab bounds
-                if _global_tokenizer.eos_token_id < vocab_size:
-                    _global_tokenizer.pad_token_id = _global_tokenizer.eos_token_id
-                    _global_tokenizer.pad_token = _global_tokenizer.eos_token
-                    logger.info(f"Set pad_token_id to eos_token_id ({_global_tokenizer.eos_token_id}) - within vocab bounds")
-                else:
-                    logger.error(f"eos_token_id ({_global_tokenizer.eos_token_id}) is out of vocab bounds ({vocab_size})!")
-                    # Fall back to using the last valid token ID
-                    _global_tokenizer.pad_token_id = vocab_size - 1
-                    logger.warning(f"Using fallback pad_token_id: {_global_tokenizer.pad_token_id}")
-            else:
-                logger.warning("Tokenizer has no eos_token_id - using vocab_size - 1 as pad_token_id")
-                _global_tokenizer.pad_token_id = vocab_size - 1
-        else:
-            # Validate existing pad_token_id is within bounds
-            if _global_tokenizer.pad_token_id >= vocab_size:
-                logger.error(f"pad_token_id ({_global_tokenizer.pad_token_id}) is out of vocab bounds ({vocab_size})!")
-                _global_tokenizer.pad_token_id = vocab_size - 1
-                logger.warning(f"Reset pad_token_id to: {_global_tokenizer.pad_token_id}")
-            else:
-                logger.debug(f"Existing pad_token_id ({_global_tokenizer.pad_token_id}) is valid")
-        
-        # CRITICAL FIX: Set padding side to "left" for CausalLM models
-        # This ensures attention_mask works correctly and prevents the model from failing to "see" the prompt
-        _global_tokenizer.padding_side = "left"
-        logger.debug(f"Set padding_side to 'left' for CausalLM compatibility")
-        
-        # Load model
+        # Load model first so we can check actual embedding size
         logger.debug("Loading model (this may take a while)...")
         _global_model = AutoModelForCausalLM.from_pretrained(
             model_id,
             **model_kwargs
         )
         
-        # CRITICAL FIX: Sync model config with tokenizer, but validate first
-        # This prevents the model from generating pad tokens during generation
-        if hasattr(_global_model, 'config') and _global_tokenizer.pad_token_id is not None:
-            # Validate pad_token_id against model vocab size
-            model_vocab_size = _global_model.config.vocab_size if hasattr(_global_model.config, 'vocab_size') else vocab_size
-            
-            if _global_tokenizer.pad_token_id < model_vocab_size:
-                _global_model.config.pad_token_id = _global_tokenizer.pad_token_id
-                logger.debug(f"Set model.config.pad_token_id to {_global_tokenizer.pad_token_id} (validated against vocab_size={model_vocab_size})")
-            else:
-                logger.error(f"Cannot set model pad_token_id: {_global_tokenizer.pad_token_id} >= model vocab_size ({model_vocab_size})")
-                logger.warning("Model config pad_token_id will remain unchanged to prevent CUDA errors")
+        # CRITICAL FIX: Get ACTUAL embedding size from model (not tokenizer vocab_size)
+        # This is the key fix - tokenizer.vocab_size can be different from model embedding table size
+        embedding_size = _global_model.get_input_embeddings().num_embeddings
+        tokenizer_vocab_size = _global_tokenizer.vocab_size
+        logger.info(f"Model embedding size: {embedding_size}")
+        logger.debug(f"Tokenizer vocab size: {tokenizer_vocab_size}")
         
-        # Validate eos_token_id as well (critical for generation)
-        if hasattr(_global_tokenizer, 'eos_token_id') and _global_tokenizer.eos_token_id is not None:
-            if _global_tokenizer.eos_token_id >= vocab_size:
-                logger.error(f"⚠️  CRITICAL: eos_token_id ({_global_tokenizer.eos_token_id}) >= vocab_size ({vocab_size})")
-                logger.error("   This WILL cause CUDA device-side assert errors during generation!")
-                raise ValueError(
-                    f"Tokenizer eos_token_id ({_global_tokenizer.eos_token_id}) is out of vocabulary bounds ({vocab_size}). "
-                    "This indicates a tokenizer/model mismatch. Please verify MODEL_ID is correct."
-                )
+        # Warn if mismatch detected (this is likely the MedGemma issue!)
+        if embedding_size != tokenizer_vocab_size:
+            logger.warning(
+                f"⚠️ MISMATCH DETECTED: tokenizer vocab_size ({tokenizer_vocab_size}) "
+                f"!= model embedding_size ({embedding_size}). This can cause CUDA errors!"
+            )
+        
+        # Log current token IDs before modification
+        logger.debug(
+            f"Original token IDs - pad: {_global_tokenizer.pad_token_id}, "
+            f"eos: {_global_tokenizer.eos_token_id}, "
+            f"bos: {_global_tokenizer.bos_token_id}"
+        )
+        
+        # CRITICAL FIX: Set pad_token_id if None (validate against EMBEDDING SIZE, not vocab_size)
+        if _global_tokenizer.pad_token_id is None:
+            if _global_tokenizer.eos_token_id is not None:
+                # Validate eos_token_id is within EMBEDDING bounds (not tokenizer vocab)
+                if _global_tokenizer.eos_token_id < embedding_size:
+                    _global_tokenizer.pad_token_id = _global_tokenizer.eos_token_id
+                    _global_tokenizer.pad_token = _global_tokenizer.eos_token
+                    logger.info(f"Set pad_token_id to eos_token_id ({_global_tokenizer.eos_token_id}) - within embedding bounds")
+                else:
+                    # DON'T use vocab_size - 1! Add proper special token and resize embeddings
+                    logger.error(f"eos_token_id ({_global_tokenizer.eos_token_id}) >= embedding_size ({embedding_size})")
+                    logger.info("Adding new <pad> token and resizing model embeddings...")
+                    _global_tokenizer.add_special_tokens({"pad_token": "<pad>"})
+                    _global_model.resize_token_embeddings(len(_global_tokenizer))
+                    _global_model.config.pad_token_id = _global_tokenizer.pad_token_id
+                    logger.info(f"✅ Added pad token, resized embeddings to {len(_global_tokenizer)}")
             else:
-                logger.debug(f"Validated eos_token_id ({_global_tokenizer.eos_token_id}) is within vocab bounds")
+                # No eos_token, add pad token properly
+                logger.warning("No eos_token_id found, adding <pad> token...")
+                _global_tokenizer.add_special_tokens({"pad_token": "<pad>"})
+                _global_model.resize_token_embeddings(len(_global_tokenizer))
+                _global_model.config.pad_token_id = _global_tokenizer.pad_token_id
+                logger.info(f"✅ Added pad token, resized embeddings to {len(_global_tokenizer)}")
+        else:
+            # Validate existing pad_token_id is within embedding bounds
+            if _global_tokenizer.pad_token_id >= embedding_size:
+                logger.error(f"pad_token_id ({_global_tokenizer.pad_token_id}) >= embedding_size ({embedding_size})!")
+                logger.info("Replacing invalid pad_token and resizing embeddings...")
+                _global_tokenizer.add_special_tokens({"pad_token": "<pad>"})
+                _global_model.resize_token_embeddings(len(_global_tokenizer))
+                _global_model.config.pad_token_id = _global_tokenizer.pad_token_id
+                logger.info(f"✅ Replaced invalid pad_token, resized embeddings to {len(_global_tokenizer)}")
+            else:
+                logger.debug(f"Existing pad_token_id ({_global_tokenizer.pad_token_id}) is valid")
+        
+        # CRITICAL FIX: Set padding side to "left" for CausalLM models
+        _global_tokenizer.padding_side = "left"
+        logger.debug(f"Set padding_side to 'left' for CausalLM compatibility")
+        
+        # CRITICAL: Hard validation - check ALL special tokens against embedding size
+        logger.info("Validating all special tokens against model embedding size...")
+        for token_name, token_id in {
+            "eos": _global_tokenizer.eos_token_id,
+            "pad": _global_tokenizer.pad_token_id,
+            "bos": _global_tokenizer.bos_token_id,
+        }.items():
+            if token_id is not None:
+                if token_id >= embedding_size:
+                    raise RuntimeError(
+                        f"❌ CRITICAL: {token_name.upper()} token ID ({token_id}) >= "
+                        f"model embedding size ({embedding_size}). "
+                        f"This WILL cause CUDA device-side assert errors during generation! "
+                        f"Tokenizer/model mismatch detected for model '{model_id}'."
+                    )
+                else:
+                    logger.debug(f"✅ {token_name}_token_id ({token_id}) is valid (< {embedding_size})")
+        
+        logger.info(f"✅ All special tokens validated successfully against embedding size ({embedding_size})")
+        
+        # Sync model config with tokenizer
+        if hasattr(_global_model, 'config') and _global_tokenizer.pad_token_id is not None:
+            _global_model.config.pad_token_id = _global_tokenizer.pad_token_id
+            logger.debug(f"Set model.config.pad_token_id to {_global_tokenizer.pad_token_id}")
         
         # Only move to device manually if NOT using device_map (i.e., for CPU)
         # Using device_map="auto" and .to(device) together causes RuntimeError
@@ -424,9 +446,10 @@ None required."""
         if options is None:
             options = {}
         
-        max_new_tokens = options.get("maxTokens", self.default_max_new_tokens)
+        # Handle both camelCase (from API) and snake_case formats
+        max_new_tokens = options.get("max_new_tokens") or options.get("maxTokens", self.default_max_new_tokens)
         temperature = options.get("temperature", self.default_temperature)
-        top_p = options.get("topP", self.default_top_p)
+        top_p = options.get("top_p") or options.get("topP", self.default_top_p)
         
         logger.info(
             f"Starting inference: prompt_len={len(prompt)}, "
@@ -458,23 +481,23 @@ None required."""
             eos_token_id = _global_tokenizer.eos_token_id
             pad_token_id = _global_tokenizer.pad_token_id
             
-            # Validate token IDs before passing to model
-            vocab_size = _global_tokenizer.vocab_size
-            if eos_token_id is not None and eos_token_id >= vocab_size:
-                logger.error(f"⚠️  eos_token_id ({eos_token_id}) >= vocab_size ({vocab_size}) - this will cause CUDA errors!")
+            # Validate token IDs before passing to model (use EMBEDDING SIZE, not vocab_size)
+            embedding_size = _global_model.get_input_embeddings().num_embeddings
+            if eos_token_id is not None and eos_token_id >= embedding_size:
+                logger.error(f"⚠️  eos_token_id ({eos_token_id}) >= embedding_size ({embedding_size}) - this will cause CUDA errors!")
                 raise RuntimeError(
                     f"Token configuration error: eos_token_id ({eos_token_id}) is out of bounds. "
                     "This indicates a tokenizer/model mismatch."
                 )
             
-            if pad_token_id is not None and pad_token_id >= vocab_size:
-                logger.error(f"⚠️  pad_token_id ({pad_token_id}) >= vocab_size ({vocab_size}) - this will cause CUDA errors!")
+            if pad_token_id is not None and pad_token_id >= embedding_size:
+                logger.error(f"⚠️  pad_token_id ({pad_token_id}) >= embedding_size ({embedding_size}) - this will cause CUDA errors!")
                 raise RuntimeError(
                     f"Token configuration error: pad_token_id ({pad_token_id}) is out of bounds. "
                     "This indicates a tokenizer/model mismatch."
                 )
             
-            logger.debug(f"Token IDs validated: eos={eos_token_id}, pad={pad_token_id}, vocab_size={vocab_size}")
+            logger.debug(f"Token IDs validated: eos={eos_token_id}, pad={pad_token_id}, embedding_size={embedding_size}")
             
             # Determine if we should use sampling
             # CRITICAL FIX: If top_p is provided (> 0), use sampling to avoid getting stuck in loops
